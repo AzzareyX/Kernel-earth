@@ -1,0 +1,147 @@
+name: Build Kernel - Redmi 12C (earth) / LineageOS 24.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: "Branch source kernel"
+        required: true
+        default: "lineage-24.0"
+        type: string
+      parallel_jobs:
+        description: "Jumlah parallel job (make -j)"
+        required: true
+        default: "4"
+        type: string
+      create_release:
+        description: "Buat GitHub Release berisi zip"
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  KERNEL_REPO: https://github.com/LineageOS/android_kernel_xiaomi_earth.git
+  CLANG_REPO: https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git
+  CLANG_BRANCH: lineage-20.0
+  AK3_REPO: https://github.com/osm0sis/AnyKernel3.git
+  DEFCONFIG: earth_defconfig
+  JOBS: ${{ github.event.inputs.parallel_jobs || '4' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Install dependency build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev ccache zip curl
+
+      - name: Clone source kernel (${{ github.event.inputs.kernel_branch || 'lineage-24.0' }})
+        run: |
+          git clone --depth=1 \
+            --branch "${{ github.event.inputs.kernel_branch || 'lineage-24.0' }}" \
+            "$KERNEL_REPO" kernel
+
+      - name: Clone toolchain resmi LineageOS (clang-r416183b)
+        run: |
+          git clone --depth=1 --branch "$CLANG_BRANCH" "$CLANG_REPO" clang
+          "$GITHUB_WORKSPACE/clang/bin/clang" --version | head -n 2
+
+      - name: Clone AnyKernel3 (tanpa fork)
+        run: git clone --depth=1 "$AK3_REPO" anykernel
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export LLVM=1
+          export LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+
+          make O=out ARCH=arm64 "$DEFCONFIG"
+          make -j"$JOBS" O=out ARCH=arm64
+
+          test -f out/arch/arm64/boot/Image.gz-dtb
+          ls -lh out/arch/arm64/boot/Image.gz-dtb
+
+      - name: Siapkan AnyKernel3
+        run: |
+          set -euo pipefail
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb anykernel/
+
+          cat > anykernel/anykernel.sh <<'AK3'
+          ### AnyKernel3 - Redmi 12C (earth)
+          properties() { '
+          kernel.string=LineageOS kernel for Redmi 12C (earth)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=earth
+          device.name2=earth_global
+          device.name3=redmi12c
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          BLOCK=/dev/block/bootdevice/by-name/boot
+          IS_SLOT_DEVICE=1
+          RAMDISK_COMPRESSION=auto
+          PATCH_VBMETA_FLAG=auto
+
+          . tools/ak3-core.sh
+
+          dump_boot
+          write_boot
+          AK3
+
+          cd anykernel
+          ZIP_NAME="LineageOS-kernel-earth-${GITHUB_SHA::7}.zip"
+          zip -r9 "../$ZIP_NAME" . -x '.git*'
+          cd ..
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+          echo "KERNEL_SHA=$(git -C kernel rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Upload artifact Image.gz-dtb
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image.gz-dtb
+          path: kernel/out/arch/arm64/boot/Image.gz-dtb
+          if-no-files-found: error
+
+      - name: Upload artifact zip AnyKernel3
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+
+      - name: Buat GitHub Release
+        if: ${{ github.event.inputs.create_release == 'true' || startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Kernel earth - ${{ github.ref_name }}
+          body: |
+            Source : LineageOS/android_kernel_xiaomi_earth
+            Branch : ${{ github.event.inputs.kernel_branch || 'lineage-24.0' }}
+            Commit : ${{ env.KERNEL_SHA }}
+            Toolchain: clang-r416183b (LineageOS)
+            Config  : earth_defconfig
+          files: |
+            ${{ env.ZIP_NAME }}
+            kernel/out/arch/arm64/boot/Image.gz-dtb

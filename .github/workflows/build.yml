@@ -291,6 +291,74 @@ jobs:
                           changed.append(
                               f"f2fs logging: {n} f2fs_msg() call(s) in {p}")
 
+          # CIP adds socket owner tracking and a nulls-list replacement helper
+          # to include/net/sock.h. If that header hunk was skipped but the
+          # callers landed, install compatible fallbacks before compiling.
+          sock_h = Path("include/net/sock.h")
+          if sock_h.exists():
+              sh = sock_h.read_text(errors="replace")
+              callers = ""
+              for caller in (Path("net/core/sock.c"),
+                             Path("net/ipv4/inet_hashtables.c")):
+                  if caller.exists():
+                      callers += caller.read_text(errors="replace")
+              sock_modified = False
+
+              if (re.search(r"\bsk_owner_(?:set|clear|put)\s*\(", callers)
+                      and "static inline void sk_owner_clear(" not in sh):
+                  anchor = "static inline void sock_release_ownership(struct sock *sk)"
+                  if anchor in sh:
+                      block = (
+                          "/* CIP socket-owner helpers; vendor header skipped. */\n"
+                          "struct module;\n"
+                          "static inline void sk_owner_set(struct sock *sk, struct module *owner)\n"
+                          "{\n"
+                          "\t(void)sk;\n"
+                          "\t(void)owner;\n"
+                          "}\n"
+                          "\n"
+                          "static inline void sk_owner_clear(struct sock *sk)\n"
+                          "{\n"
+                          "\t(void)sk;\n"
+                          "}\n"
+                          "\n"
+                          "static inline void sk_owner_put(struct sock *sk)\n"
+                          "{\n"
+                          "\t(void)sk;\n"
+                          "}\n"
+                          "\n"
+                      )
+                      sh = sh.replace(anchor, block + anchor, 1)
+                      changed.append("sock.h: added CIP sk_owner_* fallbacks")
+                      sock_modified = True
+
+              if ("sk_nulls_replace_node_init_rcu" in callers
+                      and "static inline bool sk_nulls_replace_node_init_rcu(" not in sh):
+                  anchor = "static inline void __sk_add_node(struct sock *sk, struct hlist_head *list)"
+                  if anchor in sh:
+                      block = (
+                          "static inline bool sk_nulls_replace_node_init_rcu(struct sock *old,\n"
+                          "\t\t\t\t\t\t\t  struct sock *new)\n"
+                          "{\n"
+                          "\tif (sk_hashed(old)) {\n"
+                          "\t\thlist_nulls_replace_init_rcu(&old->sk_nulls_node,\n"
+                          "\t\t\t\t\t     &new->sk_nulls_node);\n"
+                          "\t\t__sock_put(old);\n"
+                          "\t\treturn true;\n"
+                          "\t}\n"
+                          "\n"
+                          "\treturn false;\n"
+                          "}\n"
+                          "\n"
+                      )
+                      sh = sh.replace(anchor, block + anchor, 1)
+                      changed.append(
+                          "sock.h: added CIP sk_nulls_replace_node_init_rcu() fallback")
+                      sock_modified = True
+
+              if sock_modified:
+                  sock_h.write_text(sh)
+
           if changed:
               fixes.write_text("\n".join(changed) + "\n")
               print("\n".join(changed))

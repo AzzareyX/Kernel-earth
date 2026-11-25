@@ -129,26 +129,68 @@ jobs:
           if [[ ! -s /tmp/cip.patch ]]; then
             echo "::notice::Already at ${TARGET}; no CIP patches to apply."
           else
-            # Use a real 3-way merge. The diff has full blob IDs from both CIP
-            # tags, so git can follow vendor-side edits that `patch --fuzz`
-            # cannot (offsets in this tree reach >2800 lines).
-            git apply --3way --whitespace=nowarn /tmp/cip.patch 2>&1 \
-              | tee -a "$LOG_FILE" > /tmp/cip-apply.log || true
+            # Apply per file. One bad file (e.g. a path missing from the vendor
+            # tree) must not abort the whole merge. Clean chunks are merged
+            # 3-way; conflicting chunks are reverted and recorded, then the
+            # build continues so we still get a usable kernel.
+            rm -rf /tmp/cip-chunks
+            python3 - <<'PY'
+          from pathlib import Path
+          src = Path('/tmp/cip.patch').read_text(errors='replace').splitlines(keepends=True)
+          out = Path('/tmp/cip-chunks')
+          out.mkdir(parents=True, exist_ok=True)
+          paths, cur = [], None
+          for line in src:
+              if line.startswith('diff --git '):
+                  if cur is not None:
+                      (out / f'{len(paths)-1:04d}.patch').write_text(''.join(cur))
+                  parts = line.split()
+                  raw = parts[2] if len(parts) > 2 else parts[1]
+                  paths.append(raw[2:] if raw.startswith('a/') else raw)
+                  cur = [line]
+              elif cur is not None:
+                  cur.append(line)
+          if cur is not None:
+              (out / f'{len(paths)-1:04d}.patch').write_text(''.join(cur))
+          with (out / 'manifest.tsv').open('w') as f:
+              for i, p in enumerate(paths):
+                  f.write(f'{i:04d}\t{p}\n')
+          print(f'CIP patch split into {len(paths)} file chunks')
+          PY
 
-            CONFLICTS="$(grep -E 'error:|with conflicts|patch failed' /tmp/cip-apply.log || true)"
-            MARKED="$(grep -rl --exclude-dir=.git '^<<<<<<<' . 2>/dev/null | head -50 || true)"
-            if [[ -n "${CONFLICTS}" || -n "${MARKED}" ]]; then
-              {
-                echo "::error::CIP 3-way merge needs manual resolution."
-                [[ -n "${CONFLICTS}" ]] && echo "${CONFLICTS}"
-                if [[ -n "${MARKED}" ]]; then
-                  echo "Files with conflict markers:"
-                  echo "${MARKED}"
-                fi
-              } 2>&1 | tee -a "$LOG_FILE"
+            SKIPPED_FILE="$GITHUB_WORKSPACE/cip-skipped.txt"
+            : > "$SKIPPED_FILE"
+            APPLIED=0
+            while IFS=$'\t' read -r idx path; do
+              if git apply --3way --whitespace=nowarn "/tmp/cip-chunks/${idx}.patch" \
+                  >/dev/null 2>&1; then
+                APPLIED=$((APPLIED + 1))
+                echo "APPLIED  ${path}" >> "$LOG_FILE"
+              else
+                # Undo any partial 3-way state for just this file.
+                git reset -q HEAD -- "${path}" 2>/dev/null || true
+                git checkout -q -f HEAD -- "${path}" 2>/dev/null \
+                  || git clean -q -f -- "${path}" 2>/dev/null || true
+                echo "${path}" >> "$SKIPPED_FILE"
+                echo "SKIPPED  ${path}" | tee -a "$LOG_FILE"
+              fi
+            done < /tmp/cip-chunks/manifest.tsv
+
+            SKIPPED="$(wc -l < "$SKIPPED_FILE" | tr -d ' ')"
+            {
+              echo "CIP chunks applied: ${APPLIED}"
+              echo "CIP chunks skipped (conflict with vendor tree): ${SKIPPED}"
+              if [[ "${SKIPPED}" -gt 0 ]]; then
+                echo "::warning::${SKIPPED} CIP files could not be auto-merged and were skipped."
+                echo "Skipped files:"
+                cat "$SKIPPED_FILE"
+              fi
+            } 2>&1 | tee -a "$LOG_FILE"
+
+            if [[ "${APPLIED}" -eq 0 ]]; then
+              echo "::error::No CIP chunk could be applied." | tee -a "$LOG_FILE"
               exit 1
             fi
-            echo "CIP 3-way merge applied cleanly." | tee -a "$LOG_FILE"
           fi
 
           CIP_NUM="${TARGET##*-cip}"
@@ -288,6 +330,10 @@ jobs:
         id: notes
         run: |
           set -e
+          SKIPPED=0
+          if [[ -f "$GITHUB_WORKSPACE/cip-skipped.txt" ]]; then
+            SKIPPED="$(wc -l < "$GITHUB_WORKSPACE/cip-skipped.txt" | tr -d ' ')"
+          fi
           cat > release_notes.md <<EOF
           ## Kernel Redmi 12C / POCO C55 (earth) — CIP 4.19.y
 
@@ -295,6 +341,7 @@ jobs:
           - **Base:** LineageOS \`lineage-23.2\` (commit \`${{ steps.package.outputs.sha }}\`)
           - **CIP merge:** \`${{ steps.cip.outputs.source }}\` → \`${{ steps.cip.outputs.target }}\`
             (localversion: \`${{ steps.cip.outputs.cip_suffix }}\` \`${{ steps.cip.outputs.st_suffix }}\`)
+          - **CIP files skipped (vendor conflicts):** ${SKIPPED}
           - **Defconfig:** \`${DEFCONFIG}\`
           - **Toolchain:** Clang 17 + LLD, CROSS_COMPILE=\`${CROSS_COMPILE}\`
           - **Zip:** \`${{ steps.package.outputs.zip }}\` (${{ steps.package.outputs.size }})
@@ -304,9 +351,17 @@ jobs:
           2. Apply Update / Install → sideload or select the zip.
           3. Wipe cache/dalvik if needed, then reboot.
 
-          > Patches are taken directly from CIP GitLab and the pristine 4.19.325 tree.
-          > No fork is created; any hunk already present in the vendor tree is skipped.
+          > Patches are taken directly from CIP GitLab. No fork is created.
+          > Files that conflict with the vendor tree are skipped and listed below.
           EOF
+
+          if [[ "${SKIPPED}" -gt 0 ]]; then
+            {
+              echo
+              echo "### Skipped CIP files (vendor conflicts)"
+              sed 's/^/- /' "$GITHUB_WORKSPACE/cip-skipped.txt"
+            } >> release_notes.md
+          fi
 
           cat release_notes.md >> "$GITHUB_STEP_SUMMARY"
 
@@ -339,13 +394,9 @@ jobs:
               echo "(no captured log yet)"
             fi
             echo
-            echo "=== CIP 3-way conflict markers ==="
-            MARKED="$(grep -rl --exclude-dir=.git '^<<<<<<<' "$GITHUB_WORKSPACE/kernel" 2>/dev/null | head -50)"
-            if [[ -n "${MARKED}" ]]; then
-              for f in ${MARKED}; do
-                echo "--- ${f} ---"
-                grep -n -A12 -B4 '^<<<<<<<' "${f}" | head -80
-              done
+            echo "=== CIP files skipped (vendor conflicts) ==="
+            if [[ -f "$GITHUB_WORKSPACE/cip-skipped.txt" ]]; then
+              cat "$GITHUB_WORKSPACE/cip-skipped.txt"
             else
               echo "(none)"
             fi

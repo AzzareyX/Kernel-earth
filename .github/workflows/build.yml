@@ -215,6 +215,96 @@ jobs:
             echo "st_suffix=${ST_SUFFIX}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Normalize vendor/CIP API mismatches
+        run: |
+          set -euo pipefail
+          cd kernel
+          FIXES="$GITHUB_WORKSPACE/cip-fixes.txt"
+          export FIXES
+          : > "$FIXES"
+
+          # A per-file 3-way merge can leave a CIP header next to a vendor
+          # implementation (or vice versa). Fix the known API mismatches that
+          # otherwise break compilation before `make` starts.
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          fixes = Path(os.environ["FIXES"])
+          changed = []
+
+          # CIP changed to_ratio() to return u64. Keep declaration and
+          # definition consistent whichever side of the merge landed.
+          sched_h = Path("kernel/sched/sched.h")
+          sched_c = Path("kernel/sched/core.c")
+          if sched_h.exists() and sched_c.exists():
+              h = sched_h.read_text(errors="replace")
+              c = sched_c.read_text(errors="replace")
+              if re.search(r"\bu64\s+to_ratio\s*\(", h):
+                  new, n = re.subn(
+                      r"\bunsigned\s+long\s+to_ratio\s*\(", "u64 to_ratio(", c)
+                  if n:
+                      sched_c.write_text(new)
+                      changed.append(
+                          f"to_ratio: {n} definition(s) in kernel/sched/core.c aligned to u64")
+              elif re.search(r"\bunsigned\s+long\s+to_ratio\s*\(", h):
+                  new, n = re.subn(
+                      r"\bu64\s+to_ratio\s*\(", "unsigned long to_ratio(", c)
+                  if n:
+                      sched_c.write_text(new)
+                      changed.append(
+                          f"to_ratio: {n} definition(s) aligned to unsigned long")
+
+          # CIP replaced f2fs_msg() with f2fs_err()/f2fs_warn()/... macros.
+          # Convert surviving vendor call sites when the new header landed.
+          f2fs_h = Path("fs/f2fs/f2fs.h")
+          if f2fs_h.exists():
+              h = f2fs_h.read_text(errors="replace")
+              if "#define f2fs_err(" in h and "#define f2fs_msg(" not in h:
+                  levels = {
+                      "KERN_ERR": "f2fs_err",
+                      "KERN_CRIT": "f2fs_err",
+                      "KERN_ALERT": "f2fs_err",
+                      "KERN_EMERG": "f2fs_err",
+                      "KERN_WARNING": "f2fs_warn",
+                      "KERN_NOTICE": "f2fs_notice",
+                      "KERN_INFO": "f2fs_info",
+                      "KERN_DEBUG": "f2fs_debug",
+                  }
+                  pat = re.compile(
+                      r"f2fs_msg\(\s*([^,]+?)\s*,\s*(KERN_[A-Z]+)\s*,")
+
+                  def repl(m):
+                      arg = m.group(1).strip()
+                      for suffix in ("->sb", ".sb"):
+                          if arg.endswith(suffix):
+                              arg = arg[:-len(suffix)]
+                              break
+                      macro = levels.get(m.group(2), "f2fs_err")
+                      return f"{macro}({arg},"
+
+                  for p in sorted(Path("fs/f2fs").rglob("*.[ch]")):
+                      txt = p.read_text(errors="replace")
+                      new, n = pat.subn(repl, txt)
+                      if n:
+                          p.write_text(new)
+                          changed.append(
+                              f"f2fs logging: {n} f2fs_msg() call(s) in {p}")
+
+          if changed:
+              fixes.write_text("\n".join(changed) + "\n")
+              print("\n".join(changed))
+          else:
+              print("No vendor/CIP API normalization needed")
+          PY
+
+          if [[ -s "$FIXES" ]]; then
+            {
+              echo "=== Applied vendor/CIP API compatibility fixes ==="
+              cat "$FIXES"
+            } 2>&1 | tee -a "$LOG_FILE"
+          fi
+
       - name: Build kernel
         id: build
         run: |
@@ -334,6 +424,10 @@ jobs:
           if [[ -f "$GITHUB_WORKSPACE/cip-skipped.txt" ]]; then
             SKIPPED="$(wc -l < "$GITHUB_WORKSPACE/cip-skipped.txt" | tr -d ' ')"
           fi
+          FIXED=0
+          if [[ -f "$GITHUB_WORKSPACE/cip-fixes.txt" ]]; then
+            FIXED="$(wc -l < "$GITHUB_WORKSPACE/cip-fixes.txt" | tr -d ' ')"
+          fi
           cat > release_notes.md <<EOF
           ## Kernel Redmi 12C / POCO C55 (earth) — CIP 4.19.y
 
@@ -342,6 +436,7 @@ jobs:
           - **CIP merge:** \`${{ steps.cip.outputs.source }}\` → \`${{ steps.cip.outputs.target }}\`
             (localversion: \`${{ steps.cip.outputs.cip_suffix }}\` \`${{ steps.cip.outputs.st_suffix }}\`)
           - **CIP files skipped (vendor conflicts):** ${SKIPPED}
+          - **Vendor/CIP API compatibility fixes:** ${FIXED}
           - **Defconfig:** \`${DEFCONFIG}\`
           - **Toolchain:** Clang 17 + LLD, CROSS_COMPILE=\`${CROSS_COMPILE}\`
           - **Zip:** \`${{ steps.package.outputs.zip }}\` (${{ steps.package.outputs.size }})
@@ -360,6 +455,13 @@ jobs:
               echo
               echo "### Skipped CIP files (vendor conflicts)"
               sed 's/^/- /' "$GITHUB_WORKSPACE/cip-skipped.txt"
+            } >> release_notes.md
+          fi
+          if [[ "${FIXED}" -gt 0 ]]; then
+            {
+              echo
+              echo "### Vendor/CIP API compatibility fixes"
+              sed 's/^/- /' "$GITHUB_WORKSPACE/cip-fixes.txt"
             } >> release_notes.md
           fi
 
@@ -397,6 +499,13 @@ jobs:
             echo "=== CIP files skipped (vendor conflicts) ==="
             if [[ -f "$GITHUB_WORKSPACE/cip-skipped.txt" ]]; then
               cat "$GITHUB_WORKSPACE/cip-skipped.txt"
+            else
+              echo "(none)"
+            fi
+            echo
+            echo "=== Vendor/CIP API compatibility fixes ==="
+            if [[ -f "$GITHUB_WORKSPACE/cip-fixes.txt" ]]; then
+              cat "$GITHUB_WORKSPACE/cip-fixes.txt"
             else
               echo "(none)"
             fi

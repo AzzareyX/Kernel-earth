@@ -1,147 +1,286 @@
-name: Build Kernel - Redmi 12C (earth) / LineageOS 24.0
+name: Build Kernel Redmi 12C (earth) - 4.19.325 + CIP 4.19.y
 
 on:
   workflow_dispatch:
     inputs:
-      kernel_branch:
-        description: "Branch source kernel"
-        required: true
-        default: "lineage-24.0"
-        type: string
-      parallel_jobs:
-        description: "Jumlah parallel job (make -j)"
-        required: true
-        default: "4"
-        type: string
-      create_release:
-        description: "Buat GitHub Release berisi zip"
+      cip_tag:
+        description: 'Target CIP tag (blank = latest, e.g. v4.19.325-cip136)'
         required: false
-        default: false
-        type: boolean
+        default: ''
+      st_suffix:
+        description: 'Override localversion-st (blank = value from CIP tag, e.g. -st13)'
+        required: false
+        default: ''
   push:
-    tags:
-      - "v*"
+    branches: [main, master]
+  schedule:
+    - cron: '0 3 * * 1' # every Monday 03:00 UTC
+
+concurrency:
+  group: earth-kernel-build
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 env:
   KERNEL_REPO: https://github.com/LineageOS/android_kernel_xiaomi_earth.git
-  CLANG_REPO: https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git
-  CLANG_BRANCH: lineage-20.0
-  AK3_REPO: https://github.com/osm0sis/AnyKernel3.git
+  KERNEL_BRANCH: lineage-23.2
   DEFCONFIG: earth_defconfig
-  JOBS: ${{ github.event.inputs.parallel_jobs || '4' }}
+  AK3_REPO: https://github.com/osm0sis/AnyKernel3.git
+  CIP_REPO: https://gitlab.com/cip-project/cip-kernel/linux-cip.git
+  BASE_REPO: https://github.com/gregkh/linux.git
+  BASE_TAG: v4.19.325
+  LLVM_DIR: /usr/lib/llvm-17/bin
+  CROSS_COMPILE: aarch64-linux-gnu-
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    name: Build earth (4.19.325 + CIP)
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Install dependency build
+      - name: Checkout this workflow repo
+        uses: actions/checkout@v4
+
+      - name: Install toolchain and build dependencies
         run: |
-          sudo apt-get update
+          set -e
+          sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            build-essential bc bison flex libelf-dev libssl-dev ccache zip curl
+            clang-17 lld-17 llvm-17 \
+            gcc-aarch64-linux-gnu \
+            bc flex bison libssl-dev libelf-dev \
+            xz-utils curl zip unzip patch python3
+          "${LLVM_DIR}/clang" --version | head -1
+          "${CROSS_COMPILE}gcc" --version | head -1
 
-      - name: Clone source kernel (${{ github.event.inputs.kernel_branch || 'lineage-24.0' }})
+      - name: Clone LineageOS kernel source (direct, no fork)
         run: |
-          git clone --depth=1 \
-            --branch "${{ github.event.inputs.kernel_branch || 'lineage-24.0' }}" \
-            "$KERNEL_REPO" kernel
+          set -e
+          git clone --depth 1 --branch "${KERNEL_BRANCH}" "${KERNEL_REPO}" kernel
+          echo "Kernel source:"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile
+          echo "Current localversion files in source:"
+          for f in kernel/localversion*; do
+            [[ -f "$f" ]] && echo "$(basename "$f"): $(cat "$f")"
+          done
+          echo "Source commit: $(git -C kernel rev-parse HEAD)"
 
-      - name: Clone toolchain resmi LineageOS (clang-r416183b)
+      - name: Merge CIP 4.19.y patches into LineageOS tree
+        id: cip
+        working-directory: kernel
+        env:
+          CIP_TAG_INPUT: ${{ inputs.cip_tag }}
+          ST_SUFFIX_INPUT: ${{ inputs.st_suffix }}
         run: |
-          git clone --depth=1 --branch "$CLANG_BRANCH" "$CLANG_REPO" clang
-          "$GITHUB_WORKSPACE/clang/bin/clang" --version | head -n 2
+          set -euo pipefail
 
-      - name: Clone AnyKernel3 (tanpa fork)
-        run: git clone --depth=1 "$AK3_REPO" anykernel
+          # Determine target tag. Blank input -> newest v4.19.325-cipN tag on GitLab.
+          if [[ -n "${CIP_TAG_INPUT:-}" ]]; then
+            TARGET="${CIP_TAG_INPUT}"
+          else
+            TARGET="$(curl -fsSL "https://gitlab.com/api/v4/projects/cip-project%2Fcip-kernel%2Flinux-cip/repository/tags?search=v4.19.325-cip&per_page=100" \
+              | python3 -c '
+          import json, re, sys
+          tags = json.load(sys.stdin)
+          found = []
+          for t in tags:
+              m = re.fullmatch(r"v4\.19\.325-cip(\d+)", t["name"])
+              if m:
+                  found.append((int(m.group(1)), t["name"]))
+          if not found:
+              sys.exit("No v4.19.325-cipN tag found")
+          print(max(found)[1])
+          ')"
+          fi
+          echo "CIP target tag: ${TARGET}"
+
+          # Fetch the pristine 4.19.325 tree and the CIP target tree into this repo.
+          # Shallow fetch only brings the two trees we need for the diff.
+          git fetch --no-tags --depth=1 "${BASE_REPO}" \
+            "refs/tags/${BASE_TAG}:refs/tags/cip-base"
+          git fetch --no-tags --depth=1 "${CIP_REPO}" \
+            "refs/tags/${TARGET}:refs/tags/cip-target"
+
+          # Everything CIP added on top of vanilla 4.19.325 (includes the -st tree).
+          git diff --full-index cip-base cip-target > /tmp/cip.patch
+          echo "CIP patch size: $(du -h /tmp/cip.patch | cut -f1)"
+
+          # --forward skips hunks already present in the vendor tree (e.g. cip124).
+          patch -p1 --forward --batch --no-backup-if-mismatch < /tmp/cip.patch || true
+
+          REJECTS="$(find . -name '*.rej' -print)"
+          if [[ -n "${REJECTS}" ]]; then
+            echo "::error::CIP patch conflicts. Rejected files:"
+            echo "${REJECTS}"
+            exit 1
+          fi
+
+          CIP_NUM="${TARGET##*-cip}"
+          CIP_SUFFIX="-cip${CIP_NUM}"
+          ST_SUFFIX="${ST_SUFFIX_INPUT:-}"
+          if [[ -z "${ST_SUFFIX}" ]]; then
+            ST_SUFFIX="$(git show cip-target:localversion-st 2>/dev/null || true)"
+          fi
+
+          # kbuild appends all localversion* files to the release string.
+          printf '%s\n' "${CIP_SUFFIX}" > localversion-cip
+          if [[ -n "${ST_SUFFIX}" ]]; then
+            printf '%s\n' "${ST_SUFFIX}" > localversion-st
+          fi
+
+          echo "Target CIP  : ${TARGET}"
+          echo "Version bits: ${CIP_SUFFIX} ${ST_SUFFIX}"
+          {
+            echo "target=${TARGET}"
+            echo "cip_suffix=${CIP_SUFFIX}"
+            echo "st_suffix=${ST_SUFFIX}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build kernel
-        working-directory: kernel
+        id: build
         run: |
           set -euo pipefail
-          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
-          export LLVM=1
-          export LLVM_IAS=1
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          cd kernel
 
-          make O=out ARCH=arm64 "$DEFCONFIG"
-          make -j"$JOBS" O=out ARCH=arm64
+          MAKE_ARGS=(
+            -j"$(nproc)"
+            O=../out
+            ARCH=arm64
+            LLVM=1
+            LLVM_IAS=1
+            CC="${LLVM_DIR}/clang"
+            LD="${LLVM_DIR}/ld.lld"
+            AR="${LLVM_DIR}/llvm-ar"
+            NM="${LLVM_DIR}/llvm-nm"
+            OBJCOPY="${LLVM_DIR}/llvm-objcopy"
+            OBJDUMP="${LLVM_DIR}/llvm-objdump"
+            READELF="${LLVM_DIR}/llvm-readelf"
+            STRIP="${LLVM_DIR}/llvm-strip"
+            CROSS_COMPILE="${CROSS_COMPILE}"
+          )
 
-          test -f out/arch/arm64/boot/Image.gz-dtb
-          ls -lh out/arch/arm64/boot/Image.gz-dtb
+          echo "=== make ${DEFCONFIG} ==="
+          make "${MAKE_ARGS[@]}" "${DEFCONFIG}"
 
-      - name: Siapkan AnyKernel3
+          echo "=== make Image.gz-dtb ==="
+          make "${MAKE_ARGS[@]}" Image.gz-dtb
+
+          ls -lh ../out/arch/arm64/boot/Image.gz-dtb
+
+          BASE_VER="$(awk '/^VERSION/ {v=$3} /^PATCHLEVEL/ {p=$3} /^SUBLEVEL/ {s=$3} END {print v"."p"."s}' Makefile)"
+          LV="$(grep '^CONFIG_LOCALVERSION=' ../out/.config | head -1 | cut -d= -f2- | tr -d '\"')"
+          CIP_LV="$(cat localversion-cip 2>/dev/null || true)"
+          ST_LV="$(cat localversion-st 2>/dev/null || true)"
+          FULL_REL="${BASE_VER}${LV}${CIP_LV}${ST_LV}"
+          echo "kernel_version=${FULL_REL}" >> "$GITHUB_OUTPUT"
+          echo "uname -r will be: ${FULL_REL}-g<sha>"
+
+      - name: Package flashable AnyKernel3 zip
+        id: package
         run: |
           set -euo pipefail
-          cp kernel/out/arch/arm64/boot/Image.gz-dtb anykernel/
 
-          cat > anykernel/anykernel.sh <<'AK3'
-          ### AnyKernel3 - Redmi 12C (earth)
+          KVER="${{ steps.build.outputs.kernel_version }}"
+          SHORT_SHA="$(git -C kernel rev-parse --short HEAD)"
+          DATE="$(date +%Y%m%d)"
+          ZIP_NAME="kernel-earth-${KVER}-${DATE}-${SHORT_SHA}.zip"
+
+          git clone --depth 1 "${AK3_REPO}" anykernel
+          rm -rf anykernel/.git
+          cp out/arch/arm64/boot/Image.gz-dtb anykernel/Image.gz-dtb
+
+          cat > anykernel/anykernel.sh <<'AK3EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          ### AnyKernel setup
           properties() { '
-          kernel.string=LineageOS kernel for Redmi 12C (earth)
+          kernel.string=Earth Kernel
           do.devicecheck=1
           do.modules=0
           do.systemless=1
           do.cleanup=1
           do.cleanuponabort=0
           device.name1=earth
-          device.name2=earth_global
-          device.name3=redmi12c
+          device.name2=
+          device.name3=
           device.name4=
           device.name5=
           supported.versions=
           supported.patchlevels=
-          supported.vendorpatchlevels=
           '; }
 
-          BLOCK=/dev/block/bootdevice/by-name/boot
-          IS_SLOT_DEVICE=1
-          RAMDISK_COMPRESSION=auto
-          PATCH_VBMETA_FLAG=auto
+          ### AnyKernel install
+          BLOCK=/dev/block/by-name/boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
 
-          . tools/ak3-core.sh
+          . tools/ak3-core.sh;
 
-          dump_boot
-          write_boot
-          AK3
+          dump_boot;
+          write_boot;
+          AK3EOF
 
-          cd anykernel
-          ZIP_NAME="LineageOS-kernel-earth-${GITHUB_SHA::7}.zip"
-          zip -r9 "../$ZIP_NAME" . -x '.git*'
-          cd ..
-          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
-          echo "KERNEL_SHA=$(git -C kernel rev-parse HEAD)" >> "$GITHUB_ENV"
+          sed -i "s|^kernel.string=.*|kernel.string=Earth ${KVER} (LineageOS 23.2 / CIP 4.19.y) - ${SHORT_SHA}|" anykernel/anykernel.sh
 
-      - name: Upload artifact Image.gz-dtb
+          (
+            cd anykernel
+            zip -r9 "../${ZIP_NAME}" . -x '*.md'
+          )
+
+          unzip -t "${ZIP_NAME}" >/dev/null
+          echo "zip=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
+          echo "kver=${KVER}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "${ZIP_NAME}" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Image.gz-dtb
-          path: kernel/out/arch/arm64/boot/Image.gz-dtb
+          name: kernel-earth-${{ steps.package.outputs.kver }}-${{ steps.package.outputs.sha }}
+          path: |
+            ${{ steps.package.outputs.zip }}
+            out/arch/arm64/boot/Image.gz-dtb
+            out/.config
           if-no-files-found: error
+          retention-days: 14
 
-      - name: Upload artifact zip AnyKernel3
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ZIP_NAME }}
-          path: ${{ env.ZIP_NAME }}
-          if-no-files-found: error
+      - name: Generate release notes and job summary
+        id: notes
+        run: |
+          set -e
+          cat > release_notes.md <<EOF
+          ## Kernel Redmi 12C / POCO C55 (earth) — CIP 4.19.y
 
-      - name: Buat GitHub Release
-        if: ${{ github.event.inputs.create_release == 'true' || startsWith(github.ref, 'refs/tags/') }}
+          - **Release:** \`${{ steps.package.outputs.kver }}\`
+          - **Base:** LineageOS \`lineage-23.2\` (commit \`${{ steps.package.outputs.sha }}\`)
+          - **Upstream merged:** \`${{ steps.cip.outputs.target }}\` from CIP GitLab
+            (localversion: \`${{ steps.cip.outputs.cip_suffix }}\` \`${{ steps.cip.outputs.st_suffix }}\`)
+          - **Defconfig:** \`${DEFCONFIG}\`
+          - **Toolchain:** Clang 17 + LLD, CROSS_COMPILE=\`${CROSS_COMPILE}\`
+          - **Zip:** \`${{ steps.package.outputs.zip }}\` (${{ steps.package.outputs.size }})
+
+          ### Flash
+          1. Boot into LineageOS Recovery (or TWRP/OrangeFox).
+          2. Apply Update / Install → sideload or select the zip.
+          3. Wipe cache/dalvik if needed, then reboot.
+
+          > Patches are taken directly from CIP GitLab and the pristine 4.19.325 tree.
+          > No fork is created; any hunk already present in the vendor tree is skipped.
+          EOF
+
+          cat release_notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: Kernel earth - ${{ github.ref_name }}
-          body: |
-            Source : LineageOS/android_kernel_xiaomi_earth
-            Branch : ${{ github.event.inputs.kernel_branch || 'lineage-24.0' }}
-            Commit : ${{ env.KERNEL_SHA }}
-            Toolchain: clang-r416183b (LineageOS)
-            Config  : earth_defconfig
-          files: |
-            ${{ env.ZIP_NAME }}
-            kernel/out/arch/arm64/boot/Image.gz-dtb
+          tag_name: v${{ steps.package.outputs.kver }}-${{ steps.package.outputs.date }}-${{ steps.package.outputs.sha }}
+          name: Earth Kernel ${{ steps.package.outputs.kver }} (${{ steps.package.outputs.date }})
+          body_path: release_notes.md
+          files: ${{ steps.package.outputs.zip }}
+          make_latest: true
+          fail_on_unmatched_files: true

@@ -11,6 +11,14 @@ on:
         description: 'Override localversion-st (blank = value from CIP tag, e.g. -st13)'
         required: false
         default: ''
+      skip_net_patches:
+        description: 'Skip CIP networking patches so Wi-Fi/hotspot keep working'
+        required: false
+        type: choice
+        default: 'true'
+        options:
+          - 'true'
+          - 'false'
   push:
     branches: [main, master]
   schedule:
@@ -79,6 +87,7 @@ jobs:
         env:
           CIP_TAG_INPUT: ${{ inputs.cip_tag }}
           ST_SUFFIX_INPUT: ${{ inputs.st_suffix }}
+          SKIP_NET_PATCHES: ${{ inputs.skip_net_patches || 'true' }}
         run: |
           set -euo pipefail
 
@@ -161,7 +170,18 @@ jobs:
             SKIPPED_FILE="$GITHUB_WORKSPACE/cip-skipped.txt"
             : > "$SKIPPED_FILE"
             APPLIED=0
+            NET_SAFE=0
             while IFS=$'\t' read -r idx path; do
+              # Networking CIP patches change skb/socket internals that the
+              # vendor MediaTek Wi-Fi driver was not built against. They are
+              # the known cause of Wi-Fi/hotspot failing to enable, so skip
+              # them by default. Set skip_net_patches=false to force them in.
+              if [[ "${SKIP_NET_PATCHES}" == "true" ]] && \
+                 [[ "${path}" =~ ^(net/|include/net/|include/linux/skbuff\.h|include/linux/netdevice\.h|drivers/net/) ]]; then
+                NET_SAFE=$((NET_SAFE + 1))
+                echo "SKIPPED-NET  ${path}" >> "$LOG_FILE"
+                continue
+              fi
               if git apply --3way --whitespace=nowarn "/tmp/cip-chunks/${idx}.patch" \
                   >/dev/null 2>&1; then
                 APPLIED=$((APPLIED + 1))
@@ -175,6 +195,10 @@ jobs:
                 echo "SKIPPED  ${path}" | tee -a "$LOG_FILE"
               fi
             done < /tmp/cip-chunks/manifest.tsv
+
+            if [[ "${NET_SAFE}" -gt 0 ]]; then
+              echo "[network-safe] ${NET_SAFE} networking CIP files skipped to keep Wi-Fi/hotspot working" >> "$SKIPPED_FILE"
+            fi
 
             SKIPPED="$(wc -l < "$SKIPPED_FILE" | tr -d ' ')"
             {
@@ -360,11 +384,9 @@ jobs:
               # skbuff.c to a global API declared in sock.h. If the header
               # chunk was skipped while the net/socket.c user landed, add
               # the missing declaration.
-              rmem_users = ""
-              for caller in (Path("net/socket.c"), Path("net/core/skbuff.c")):
-                  if caller.exists():
-                      rmem_users += caller.read_text(errors="replace")
-              if ("sock_rmem_free" in rmem_users
+              rmem_user = Path("net/socket.c")
+              if (rmem_user.exists()
+                      and "sock_rmem_free" in rmem_user.read_text(errors="replace")
                       and not re.search(r"\bvoid\s+sock_rmem_free\s*\(", sh)):
                   anchor = "void sock_rfree(struct sk_buff *skb);"
                   if anchor in sh:

@@ -102,34 +102,51 @@ jobs:
           fi
           echo "CIP target tag: ${TARGET}" | tee -a "$LOG_FILE"
 
-          # Fetch the pristine 4.19.325 tree and the CIP target tree into this repo.
-          # Shallow fetch only brings the two trees we need for the diff.
+          # Start from the CIP level already present in the vendor tree, not from
+          # vanilla 4.19.325. This avoids thousands of "already applied" hunks.
+          CURRENT_SUFFIX="$(cat localversion-cip 2>/dev/null || true)"
+          if [[ "${CURRENT_SUFFIX}" =~ ^-cip([0-9]+)$ ]]; then
+            SOURCE_TAG="v4.19.325-cip${BASH_REMATCH[1]}"
+            SOURCE_REPO="${CIP_REPO}"
+          else
+            SOURCE_TAG="${BASE_TAG}"
+            SOURCE_REPO="${BASE_REPO}"
+          fi
+          echo "CIP source level: ${SOURCE_TAG} (localversion '${CURRENT_SUFFIX:-none}')" \
+            | tee -a "$LOG_FILE"
+
           {
-            git fetch --no-tags --depth=1 "${BASE_REPO}" \
-              "refs/tags/${BASE_TAG}:refs/tags/cip-base"
+            git fetch --no-tags --depth=1 "${SOURCE_REPO}" \
+              "refs/tags/${SOURCE_TAG}:refs/tags/cip-source"
             git fetch --no-tags --depth=1 "${CIP_REPO}" \
               "refs/tags/${TARGET}:refs/tags/cip-target"
 
-            # Everything CIP added on top of vanilla 4.19.325 (includes the -st tree).
-            git diff --full-index cip-base cip-target > /tmp/cip.patch
-            echo "CIP patch size: $(du -h /tmp/cip.patch | cut -f1)"
+            # Only the patches added after the source's current CIP level.
+            git diff --full-index cip-source cip-target > /tmp/cip.patch
+            echo "Incremental CIP patch (${SOURCE_TAG} -> ${TARGET}): $(du -h /tmp/cip.patch | cut -f1)"
           } 2>&1 | tee -a "$LOG_FILE"
 
-          # --forward skips hunks already present in the vendor tree (e.g. cip124).
-          patch -p1 --forward --batch --no-backup-if-mismatch < /tmp/cip.patch 2>&1 \
-            | tee -a "$LOG_FILE" || true
+          if [[ ! -s /tmp/cip.patch ]]; then
+            echo "::notice::Already at ${TARGET}; no CIP patches to apply."
+          else
+            # Reversed hunks mean the fix is already in the vendor tree. Send
+            # rejects to /dev/null so they don't cause false failures.
+            patch -p1 --forward --batch --fuzz=3 --no-backup-if-mismatch \
+              -r /dev/null < /tmp/cip.patch 2>&1 \
+              | tee -a "$LOG_FILE" > /tmp/cip-patch.log || true
 
-          REJECTS="$(find . -name '*.rej' -print)"
-          if [[ -n "${REJECTS}" ]]; then
-            {
-              echo "::error::CIP patch conflicts. Rejected files:"
-              echo "${REJECTS}"
-              for f in ${REJECTS}; do
-                echo "--- ${f} ---"
-                cat "${f}"
-              done
-            } 2>&1 | tee -a "$LOG_FILE"
-            exit 1
+            SKIPPED="$(grep -c 'Reversed (or previously applied)' /tmp/cip-patch.log || true)"
+            echo "Already-applied hunks skipped: ${SKIPPED}" | tee -a "$LOG_FILE"
+
+            FAILED="$(grep -E 'Hunk .* FAILED|can.t find file to patch|Only garbage was found' \
+              /tmp/cip-patch.log || true)"
+            if [[ -n "${FAILED}" ]]; then
+              {
+                echo "::error::CIP patch has real conflicts. Failed hunks:"
+                echo "${FAILED}"
+              } 2>&1 | tee -a "$LOG_FILE"
+              exit 1
+            fi
           fi
 
           CIP_NUM="${TARGET##*-cip}"
@@ -148,6 +165,7 @@ jobs:
           echo "Target CIP  : ${TARGET}"
           echo "Version bits: ${CIP_SUFFIX} ${ST_SUFFIX}"
           {
+            echo "source=${SOURCE_TAG}"
             echo "target=${TARGET}"
             echo "cip_suffix=${CIP_SUFFIX}"
             echo "st_suffix=${ST_SUFFIX}"
@@ -273,7 +291,7 @@ jobs:
 
           - **Release:** \`${{ steps.package.outputs.kver }}\`
           - **Base:** LineageOS \`lineage-23.2\` (commit \`${{ steps.package.outputs.sha }}\`)
-          - **Upstream merged:** \`${{ steps.cip.outputs.target }}\` from CIP GitLab
+          - **CIP merge:** \`${{ steps.cip.outputs.source }}\` → \`${{ steps.cip.outputs.target }}\`
             (localversion: \`${{ steps.cip.outputs.cip_suffix }}\` \`${{ steps.cip.outputs.st_suffix }}\`)
           - **Defconfig:** \`${DEFCONFIG}\`
           - **Toolchain:** Clang 17 + LLD, CROSS_COMPILE=\`${CROSS_COMPILE}\`

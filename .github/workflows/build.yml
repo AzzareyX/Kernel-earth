@@ -356,8 +356,40 @@ jobs:
                           "sock.h: added CIP sk_nulls_replace_node_init_rcu() fallback")
                       sock_modified = True
 
+              # CIP promotes sock_rmem_free() from a static helper in
+              # skbuff.c to a global API declared in sock.h. If the header
+              # chunk was skipped while the net/socket.c user landed, add
+              # the missing declaration.
+              rmem_users = ""
+              for caller in (Path("net/socket.c"), Path("net/core/skbuff.c")):
+                  if caller.exists():
+                      rmem_users += caller.read_text(errors="replace")
+              if ("sock_rmem_free" in rmem_users
+                      and not re.search(r"\bvoid\s+sock_rmem_free\s*\(", sh)):
+                  anchor = "void sock_rfree(struct sk_buff *skb);"
+                  if anchor in sh:
+                      sh = sh.replace(
+                          anchor,
+                          anchor + "\nvoid sock_rmem_free(struct sk_buff *skb);", 1)
+                      changed.append("sock.h: added sock_rmem_free() declaration")
+                      sock_modified = True
+
               if sock_modified:
                   sock_h.write_text(sh)
+
+          # If the skbuff.c chunk was skipped, promote the static definition
+          # so the new declaration and the external user link correctly.
+          skbuff_c = Path("net/core/skbuff.c")
+          socket_c = Path("net/socket.c")
+          if (skbuff_c.exists() and socket_c.exists()
+                  and "sock_rmem_free" in socket_c.read_text(errors="replace")):
+              sc = skbuff_c.read_text(errors="replace")
+              new, n = re.subn(r"\bstatic\s+void\s+sock_rmem_free\s*\(",
+                               "void sock_rmem_free(", sc)
+              if n:
+                  skbuff_c.write_text(new)
+                  changed.append(
+                      f"skbuff.c: made sock_rmem_free() global ({n} definition)")
 
           if changed:
               fixes.write_text("\n".join(changed) + "\n")

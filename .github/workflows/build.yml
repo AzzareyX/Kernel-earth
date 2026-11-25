@@ -129,24 +129,26 @@ jobs:
           if [[ ! -s /tmp/cip.patch ]]; then
             echo "::notice::Already at ${TARGET}; no CIP patches to apply."
           else
-            # Reversed hunks mean the fix is already in the vendor tree. Send
-            # rejects to /dev/null so they don't cause false failures.
-            patch -p1 --forward --batch --fuzz=3 --no-backup-if-mismatch \
-              -r /dev/null < /tmp/cip.patch 2>&1 \
-              | tee -a "$LOG_FILE" > /tmp/cip-patch.log || true
+            # Use a real 3-way merge. The diff has full blob IDs from both CIP
+            # tags, so git can follow vendor-side edits that `patch --fuzz`
+            # cannot (offsets in this tree reach >2800 lines).
+            git apply --3way --whitespace=nowarn /tmp/cip.patch 2>&1 \
+              | tee -a "$LOG_FILE" > /tmp/cip-apply.log || true
 
-            SKIPPED="$(grep -c 'Reversed (or previously applied)' /tmp/cip-patch.log || true)"
-            echo "Already-applied hunks skipped: ${SKIPPED}" | tee -a "$LOG_FILE"
-
-            FAILED="$(grep -E 'Hunk .* FAILED|can.t find file to patch|Only garbage was found' \
-              /tmp/cip-patch.log || true)"
-            if [[ -n "${FAILED}" ]]; then
+            CONFLICTS="$(grep -E 'error:|with conflicts|patch failed' /tmp/cip-apply.log || true)"
+            MARKED="$(grep -rl --exclude-dir=.git '^<<<<<<<' . 2>/dev/null | head -50 || true)"
+            if [[ -n "${CONFLICTS}" || -n "${MARKED}" ]]; then
               {
-                echo "::error::CIP patch has real conflicts. Failed hunks:"
-                echo "${FAILED}"
+                echo "::error::CIP 3-way merge needs manual resolution."
+                [[ -n "${CONFLICTS}" ]] && echo "${CONFLICTS}"
+                if [[ -n "${MARKED}" ]]; then
+                  echo "Files with conflict markers:"
+                  echo "${MARKED}"
+                fi
               } 2>&1 | tee -a "$LOG_FILE"
               exit 1
             fi
+            echo "CIP 3-way merge applied cleanly." | tee -a "$LOG_FILE"
           fi
 
           CIP_NUM="${TARGET##*-cip}"
@@ -337,12 +339,12 @@ jobs:
               echo "(no captured log yet)"
             fi
             echo
-            echo "=== CIP patch rejects ==="
-            REJ="$(find "$GITHUB_WORKSPACE/kernel" -name '*.rej' -print 2>/dev/null)"
-            if [[ -n "${REJ}" ]]; then
-              for f in ${REJ}; do
+            echo "=== CIP 3-way conflict markers ==="
+            MARKED="$(grep -rl --exclude-dir=.git '^<<<<<<<' "$GITHUB_WORKSPACE/kernel" 2>/dev/null | head -50)"
+            if [[ -n "${MARKED}" ]]; then
+              for f in ${MARKED}; do
                 echo "--- ${f} ---"
-                cat "${f}"
+                grep -n -A12 -B4 '^<<<<<<<' "${f}" | head -80
               done
             else
               echo "(none)"

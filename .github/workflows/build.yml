@@ -1,653 +1,495 @@
-name: Build Kernel Redmi 12C (earth) - 4.19.325 + CIP 4.19.y
+name: Merge CIP into lineage-23.2
 
 on:
   workflow_dispatch:
     inputs:
-      cip_tag:
-        description: 'Target CIP tag (blank = latest, e.g. v4.19.325-cip136)'
+      source-branch:
+        description: 'Branch to merge into'
+        required: true
+        default: 'lineage-23.2'
+        type: string
+      target-branch:
+        description: 'Branch to create/push with the merge result'
+        required: true
+        default: 'cip/4.19.325-cip137-merge'
+        type: string
+      cip-base-tag:
+        description: 'CIP tag matching the current localversion files'
+        required: true
+        default: 'v4.19.325-cip124'
+        type: string
+      cip-target-tag:
+        description: 'CIP tag to merge (carries the -st version too)'
+        required: true
+        default: 'v4.19.325-cip137'
+        type: string
+      open-pr:
+        description: 'Open a pull request for the merge branch'
         required: false
-        default: ''
-      st_suffix:
-        description: 'Override localversion-st (blank = value from CIP tag, e.g. -st13)'
+        default: true
+        type: boolean
+      dry-run:
+        description: 'Resolve and verify locally, but do not push or open a PR'
         required: false
-        default: ''
-      skip_net_patches:
-        description: 'Skip CIP networking patches so Wi-Fi/hotspot keep working'
-        required: false
-        type: choice
-        default: 'true'
-        options:
-          - 'true'
-          - 'false'
-  push:
-    branches: [main, master]
-  schedule:
-    - cron: '0 3 * * 1' # every Monday 03:00 UTC
-
-concurrency:
-  group: earth-kernel-build
-  cancel-in-progress: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
-
-env:
-  KERNEL_REPO: https://github.com/LineageOS/android_kernel_xiaomi_earth.git
-  KERNEL_BRANCH: lineage-23.2
-  DEFCONFIG: earth_defconfig
-  AK3_REPO: https://github.com/osm0sis/AnyKernel3.git
-  CIP_REPO: https://gitlab.com/cip-project/cip-kernel/linux-cip.git
-  BASE_REPO: https://github.com/gregkh/linux.git
-  BASE_TAG: v4.19.325
-  LLVM_DIR: /usr/lib/llvm-17/bin
-  CROSS_COMPILE: aarch64-linux-gnu-
-  LOG_FILE: ${{ github.workspace }}/build-log.txt
+  pull-requests: write
 
 jobs:
-  build:
-    name: Build earth (4.19.325 + CIP)
-    runs-on: ubuntu-24.04
-
+  merge:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout this workflow repo
+      - name: Checkout kernel branch
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-branch }}
+          fetch-depth: 1
+          token: ${{ secrets.CIP_MERGE_TOKEN || github.token }}
 
-      - name: Install toolchain and build dependencies
+      - name: Fetch CIP base and target tags
         run: |
           set -euo pipefail
-          : > "$LOG_FILE"
-          {
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends \
-              clang-17 lld-17 llvm-17 \
-              gcc-aarch64-linux-gnu \
-              bc flex bison libssl-dev libelf-dev \
-              xz-utils curl zip unzip patch python3
-            "${LLVM_DIR}/clang" --version | head -1
-            "${CROSS_COMPILE}gcc" --version | head -1
-          } 2>&1 | tee -a "$LOG_FILE"
+          git fetch --depth=1 https://gitlab.com/cip-project/cip-kernel/linux-cip.git \
+            "refs/tags/${{ inputs.cip-base-tag }}:refs/tags/${{ inputs.cip-base-tag }}" \
+            "refs/tags/${{ inputs.cip-target-tag }}:refs/tags/${{ inputs.cip-target-tag }}"
 
-      - name: Clone LineageOS kernel source (direct, no fork)
-        run: |
-          set -euo pipefail
-          {
-            git clone --depth 1 --branch "${KERNEL_BRANCH}" "${KERNEL_REPO}" kernel
-            echo "Kernel source:"
-            grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile
-            echo "Current localversion files in source:"
-            for f in kernel/localversion*; do
-              [[ -f "$f" ]] && echo "$(basename "$f"): $(cat "$f")"
-            done
-            echo "Source commit: $(git -C kernel rev-parse HEAD)"
-          } 2>&1 | tee -a "$LOG_FILE"
-
-      - name: Merge CIP 4.19.y patches into LineageOS tree
-        id: cip
-        working-directory: kernel
+      - name: Merge, resolve all conflicts, commit and push
         env:
-          CIP_TAG_INPUT: ${{ inputs.cip_tag }}
-          ST_SUFFIX_INPUT: ${{ inputs.st_suffix }}
-          SKIP_NET_PATCHES: ${{ inputs.skip_net_patches || 'true' }}
+          SOURCE_BRANCH: ${{ inputs.source-branch }}
+          TARGET_BRANCH: ${{ inputs.target-branch }}
+          CIP_BASE_TAG: ${{ inputs.cip-base-tag }}
+          CIP_TARGET_TAG: ${{ inputs.cip-target-tag }}
+          OPEN_PR: ${{ inputs.open-pr }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          GH_TOKEN: ${{ secrets.CIP_MERGE_TOKEN || github.token }}
         run: |
           set -euo pipefail
 
-          # Determine target tag. Blank input -> newest v4.19.325-cipN tag on GitLab.
-          if [[ -n "${CIP_TAG_INPUT:-}" ]]; then
-            TARGET="${CIP_TAG_INPUT}"
-          else
-            TARGET="$(curl -fsSL "https://gitlab.com/api/v4/projects/cip-project%2Fcip-kernel%2Flinux-cip/repository/tags?search=v4.19.325-cip&per_page=100" \
-              | python3 -c '
-          import json, re, sys
-          tags = json.load(sys.stdin)
-          found = []
-          for t in tags:
-              m = re.fullmatch(r"v4\.19\.325-cip(\d+)", t["name"])
-              if m:
-                  found.append((int(m.group(1)), t["name"]))
-          if not found:
-              sys.exit("No v4.19.325-cipN tag found")
-          print(max(found)[1])
-          ')"
-          fi
-          echo "CIP target tag: ${TARGET}" | tee -a "$LOG_FILE"
+          log()  { printf '[cip-merge] %s\n' "$*"; }
+          fail() { printf '[cip-merge] ERROR: %s\n' "$*" >&2; exit 1; }
+          warn() { printf '[cip-merge] WARNING: %s\n' "$*"; }
 
-          # Start from the CIP level already present in the vendor tree, not from
-          # vanilla 4.19.325. This avoids thousands of "already applied" hunks.
-          CURRENT_SUFFIX="$(cat localversion-cip 2>/dev/null || true)"
-          if [[ "${CURRENT_SUFFIX}" =~ ^-cip([0-9]+)$ ]]; then
-            SOURCE_TAG="v4.19.325-cip${BASH_REMATCH[1]}"
-            SOURCE_REPO="${CIP_REPO}"
-          else
-            SOURCE_TAG="${BASE_TAG}"
-            SOURCE_REPO="${BASE_REPO}"
-          fi
-          echo "CIP source level: ${SOURCE_TAG} (localversion '${CURRENT_SUFFIX:-none}')" \
-            | tee -a "$LOG_FILE"
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
 
-          {
-            git fetch --no-tags --depth=1 "${SOURCE_REPO}" \
-              "refs/tags/${SOURCE_TAG}:refs/tags/cip-source"
-            git fetch --no-tags --depth=1 "${CIP_REPO}" \
-              "refs/tags/${TARGET}:refs/tags/cip-target"
+          [ "$(make -s kernelversion)" = "4.19.325" ] \
+            || fail "expected kernel version 4.19.325"
+          OURS="$(git rev-parse HEAD)"
 
-            # Only the patches added after the source's current CIP level.
-            git diff --full-index cip-source cip-target > /tmp/cip.patch
-            echo "Incremental CIP patch (${SOURCE_TAG} -> ${TARGET}): $(du -h /tmp/cip.patch | cut -f1)"
-          } 2>&1 | tee -a "$LOG_FILE"
+          BASE_CIP="$(git show "$CIP_BASE_TAG:localversion-cip")"
+          BASE_ST="$(git show "$CIP_BASE_TAG:localversion-st")"
+          [ "$BASE_CIP" = "$(cat localversion-cip)" ] \
+            || fail "localversion-cip is '$(cat localversion-cip)', base tag has '$BASE_CIP'"
+          [ "$BASE_ST" = "$(cat localversion-st)" ] \
+            || fail "localversion-st is '$(cat localversion-st)', base tag has '$BASE_ST'"
 
-          if [[ ! -s /tmp/cip.patch ]]; then
-            echo "::notice::Already at ${TARGET}; no CIP patches to apply."
-          else
-            # Apply per file. One bad file (e.g. a path missing from the vendor
-            # tree) must not abort the whole merge. Clean chunks are merged
-            # 3-way; conflicting chunks are reverted and recorded, then the
-            # build continues so we still get a usable kernel.
-            rm -rf /tmp/cip-chunks
-            python3 - <<'PY'
-          from pathlib import Path
-          src = Path('/tmp/cip.patch').read_text(errors='replace').splitlines(keepends=True)
-          out = Path('/tmp/cip-chunks')
-          out.mkdir(parents=True, exist_ok=True)
-          paths, cur = [], None
-          for line in src:
-              if line.startswith('diff --git '):
-                  if cur is not None:
-                      (out / f'{len(paths)-1:04d}.patch').write_text(''.join(cur))
-                  parts = line.split()
-                  raw = parts[2] if len(parts) > 2 else parts[1]
-                  paths.append(raw[2:] if raw.startswith('a/') else raw)
-                  cur = [line]
-              elif cur is not None:
-                  cur.append(line)
-          if cur is not None:
-              (out / f'{len(paths)-1:04d}.patch').write_text(''.join(cur))
-          with (out / 'manifest.tsv').open('w') as f:
-              for i, p in enumerate(paths):
-                  f.write(f'{i:04d}\t{p}\n')
-          print(f'CIP patch split into {len(paths)} file chunks')
-          PY
+          CIP_TARGET="$(git rev-parse "$CIP_TARGET_TAG^{commit}")"
+          TARGET_CIP="$(git show "$CIP_TARGET_TAG:localversion-cip")"
+          TARGET_ST="$(git show "$CIP_TARGET_TAG:localversion-st")"
+          log "target versions: $TARGET_CIP / $TARGET_ST"
 
-            SKIPPED_FILE="$GITHUB_WORKSPACE/cip-skipped.txt"
-            : > "$SKIPPED_FILE"
-            APPLIED=0
-            NET_SAFE=0
-            while IFS=$'\t' read -r idx path; do
-              # Networking CIP patches change skb/socket internals that the
-              # vendor MediaTek Wi-Fi driver was not built against. They are
-              # the known cause of Wi-Fi/hotspot failing to enable, so skip
-              # them by default. Set skip_net_patches=false to force them in.
-              if [[ "${SKIP_NET_PATCHES}" == "true" ]] && \
-                 [[ "${path}" =~ ^(net/|include/net/|include/linux/skbuff\.h|include/linux/netdevice\.h|drivers/net/) ]]; then
-                NET_SAFE=$((NET_SAFE + 1))
-                echo "SKIPPED-NET  ${path}" >> "$LOG_FILE"
-                continue
-              fi
-              if git apply --3way --whitespace=nowarn "/tmp/cip-chunks/${idx}.patch" \
-                  >/dev/null 2>&1; then
-                APPLIED=$((APPLIED + 1))
-                echo "APPLIED  ${path}" >> "$LOG_FILE"
-              else
-                # Undo any partial 3-way state for just this file.
-                git reset -q HEAD -- "${path}" 2>/dev/null || true
-                git checkout -q -f HEAD -- "${path}" 2>/dev/null \
-                  || git clean -q -f -- "${path}" 2>/dev/null || true
-                echo "${path}" >> "$SKIPPED_FILE"
-                echo "SKIPPED  ${path}" | tee -a "$LOG_FILE"
-              fi
-            done < /tmp/cip-chunks/manifest.tsv
+          MERGE_TREE_HELP="$(git merge-tree -h 2>&1 || true)"
+          case "$MERGE_TREE_HELP" in
+            *merge-base*) ;;
+            *) fail "git too old; git >= 2.38 required for merge-tree --merge-base" ;;
+          esac
 
-            if [[ "${NET_SAFE}" -gt 0 ]]; then
-              echo "[network-safe] ${NET_SAFE} networking CIP files skipped to keep Wi-Fi/hotspot working" >> "$SKIPPED_FILE"
-            fi
+          log "computing synthetic 3-way merge"
+          BASE_SYN="$(printf 'CIP base %s\n' "$CIP_BASE_TAG" \
+            | git commit-tree "$(git rev-parse "$CIP_BASE_TAG^{tree}")")"
+          OURS_SYN="$(printf 'vendor %s\n' "$SOURCE_BRANCH" \
+            | git commit-tree "$(git rev-parse "$OURS^{tree}")")"
+          THEIRS_SYN="$(printf 'CIP target %s\n' "$CIP_TARGET_TAG" \
+            | git commit-tree "$(git rev-parse "$CIP_TARGET^{tree}")")"
 
-            SKIPPED="$(wc -l < "$SKIPPED_FILE" | tr -d ' ')"
-            {
-              echo "CIP chunks applied: ${APPLIED}"
-              echo "CIP chunks skipped (conflict with vendor tree): ${SKIPPED}"
-              if [[ "${SKIPPED}" -gt 0 ]]; then
-                echo "::warning::${SKIPPED} CIP files could not be auto-merged and were skipped."
-                echo "Skipped files:"
-                cat "$SKIPPED_FILE"
-              fi
-            } 2>&1 | tee -a "$LOG_FILE"
-
-            if [[ "${APPLIED}" -eq 0 ]]; then
-              echo "::error::No CIP chunk could be applied." | tee -a "$LOG_FILE"
-              exit 1
-            fi
-          fi
-
-          CIP_NUM="${TARGET##*-cip}"
-          CIP_SUFFIX="-cip${CIP_NUM}"
-          ST_SUFFIX="${ST_SUFFIX_INPUT:-}"
-          if [[ -z "${ST_SUFFIX}" ]]; then
-            ST_SUFFIX="$(git show cip-target:localversion-st 2>/dev/null || true)"
-          fi
-
-          # kbuild appends all localversion* files to the release string.
-          printf '%s\n' "${CIP_SUFFIX}" > localversion-cip
-          if [[ -n "${ST_SUFFIX}" ]]; then
-            printf '%s\n' "${ST_SUFFIX}" > localversion-st
-          fi
-
-          echo "Target CIP  : ${TARGET}"
-          echo "Version bits: ${CIP_SUFFIX} ${ST_SUFFIX}"
-          {
-            echo "source=${SOURCE_TAG}"
-            echo "target=${TARGET}"
-            echo "cip_suffix=${CIP_SUFFIX}"
-            echo "st_suffix=${ST_SUFFIX}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Normalize vendor/CIP API mismatches
-        run: |
-          set -euo pipefail
-          cd kernel
-          FIXES="$GITHUB_WORKSPACE/cip-fixes.txt"
-          export FIXES
-          : > "$FIXES"
-
-          # A per-file 3-way merge can leave a CIP header next to a vendor
-          # implementation (or vice versa). Fix the known API mismatches that
-          # otherwise break compilation before `make` starts.
-          python3 - <<'PY'
-          import os, re
-          from pathlib import Path
-
-          fixes = Path(os.environ["FIXES"])
-          changed = []
-
-          # CIP changed to_ratio() to return u64. Keep declaration and
-          # definition consistent whichever side of the merge landed.
-          sched_h = Path("kernel/sched/sched.h")
-          sched_c = Path("kernel/sched/core.c")
-          if sched_h.exists() and sched_c.exists():
-              h = sched_h.read_text(errors="replace")
-              c = sched_c.read_text(errors="replace")
-              if re.search(r"\bu64\s+to_ratio\s*\(", h):
-                  new, n = re.subn(
-                      r"\bunsigned\s+long\s+to_ratio\s*\(", "u64 to_ratio(", c)
-                  if n:
-                      sched_c.write_text(new)
-                      changed.append(
-                          f"to_ratio: {n} definition(s) in kernel/sched/core.c aligned to u64")
-              elif re.search(r"\bunsigned\s+long\s+to_ratio\s*\(", h):
-                  new, n = re.subn(
-                      r"\bu64\s+to_ratio\s*\(", "unsigned long to_ratio(", c)
-                  if n:
-                      sched_c.write_text(new)
-                      changed.append(
-                          f"to_ratio: {n} definition(s) aligned to unsigned long")
-
-          # CIP replaced f2fs_msg() with f2fs_err()/f2fs_warn()/... macros.
-          # Convert surviving vendor call sites when the new header landed.
-          f2fs_h = Path("fs/f2fs/f2fs.h")
-          if f2fs_h.exists():
-              h = f2fs_h.read_text(errors="replace")
-              if "#define f2fs_err(" in h and "#define f2fs_msg(" not in h:
-                  levels = {
-                      "KERN_ERR": "f2fs_err",
-                      "KERN_CRIT": "f2fs_err",
-                      "KERN_ALERT": "f2fs_err",
-                      "KERN_EMERG": "f2fs_err",
-                      "KERN_WARNING": "f2fs_warn",
-                      "KERN_NOTICE": "f2fs_notice",
-                      "KERN_INFO": "f2fs_info",
-                      "KERN_DEBUG": "f2fs_debug",
-                  }
-                  pat = re.compile(
-                      r"f2fs_msg\(\s*([^,]+?)\s*,\s*(KERN_[A-Z]+)\s*,")
-
-                  def repl(m):
-                      arg = m.group(1).strip()
-                      for suffix in ("->sb", ".sb"):
-                          if arg.endswith(suffix):
-                              arg = arg[:-len(suffix)]
-                              break
-                      macro = levels.get(m.group(2), "f2fs_err")
-                      return f"{macro}({arg},"
-
-                  for p in sorted(Path("fs/f2fs").rglob("*.[ch]")):
-                      txt = p.read_text(errors="replace")
-                      new, n = pat.subn(repl, txt)
-                      if n:
-                          p.write_text(new)
-                          changed.append(
-                              f"f2fs logging: {n} f2fs_msg() call(s) in {p}")
-
-          # CIP adds socket owner tracking and a nulls-list replacement helper
-          # to include/net/sock.h. If that header hunk was skipped but the
-          # callers landed, install compatible fallbacks before compiling.
-          sock_h = Path("include/net/sock.h")
-          if sock_h.exists():
-              sh = sock_h.read_text(errors="replace")
-              callers = ""
-              for caller in (Path("net/core/sock.c"),
-                             Path("net/ipv4/inet_hashtables.c")):
-                  if caller.exists():
-                      callers += caller.read_text(errors="replace")
-              sock_modified = False
-
-              if (re.search(r"\bsk_owner_(?:set|clear|put)\s*\(", callers)
-                      and "static inline void sk_owner_clear(" not in sh):
-                  anchor = "static inline void sock_release_ownership(struct sock *sk)"
-                  if anchor in sh:
-                      block = (
-                          "/* CIP socket-owner helpers; vendor header skipped. */\n"
-                          "struct module;\n"
-                          "static inline void sk_owner_set(struct sock *sk, struct module *owner)\n"
-                          "{\n"
-                          "\t(void)sk;\n"
-                          "\t(void)owner;\n"
-                          "}\n"
-                          "\n"
-                          "static inline void sk_owner_clear(struct sock *sk)\n"
-                          "{\n"
-                          "\t(void)sk;\n"
-                          "}\n"
-                          "\n"
-                          "static inline void sk_owner_put(struct sock *sk)\n"
-                          "{\n"
-                          "\t(void)sk;\n"
-                          "}\n"
-                          "\n"
-                      )
-                      sh = sh.replace(anchor, block + anchor, 1)
-                      changed.append("sock.h: added CIP sk_owner_* fallbacks")
-                      sock_modified = True
-
-              if ("sk_nulls_replace_node_init_rcu" in callers
-                      and "static inline bool sk_nulls_replace_node_init_rcu(" not in sh):
-                  anchor = "static inline void __sk_add_node(struct sock *sk, struct hlist_head *list)"
-                  if anchor in sh:
-                      block = (
-                          "static inline bool sk_nulls_replace_node_init_rcu(struct sock *old,\n"
-                          "\t\t\t\t\t\t\t  struct sock *new)\n"
-                          "{\n"
-                          "\tif (sk_hashed(old)) {\n"
-                          "\t\thlist_nulls_replace_init_rcu(&old->sk_nulls_node,\n"
-                          "\t\t\t\t\t     &new->sk_nulls_node);\n"
-                          "\t\t__sock_put(old);\n"
-                          "\t\treturn true;\n"
-                          "\t}\n"
-                          "\n"
-                          "\treturn false;\n"
-                          "}\n"
-                          "\n"
-                      )
-                      sh = sh.replace(anchor, block + anchor, 1)
-                      changed.append(
-                          "sock.h: added CIP sk_nulls_replace_node_init_rcu() fallback")
-                      sock_modified = True
-
-              # CIP promotes sock_rmem_free() from a static helper in
-              # skbuff.c to a global API declared in sock.h. If the header
-              # chunk was skipped while the net/socket.c user landed, add
-              # the missing declaration.
-              rmem_user = Path("net/socket.c")
-              if (rmem_user.exists()
-                      and "sock_rmem_free" in rmem_user.read_text(errors="replace")
-                      and not re.search(r"\bvoid\s+sock_rmem_free\s*\(", sh)):
-                  anchor = "void sock_rfree(struct sk_buff *skb);"
-                  if anchor in sh:
-                      sh = sh.replace(
-                          anchor,
-                          anchor + "\nvoid sock_rmem_free(struct sk_buff *skb);", 1)
-                      changed.append("sock.h: added sock_rmem_free() declaration")
-                      sock_modified = True
-
-              if sock_modified:
-                  sock_h.write_text(sh)
-
-          # If the skbuff.c chunk was skipped, promote the static definition
-          # so the new declaration and the external user link correctly.
-          skbuff_c = Path("net/core/skbuff.c")
-          socket_c = Path("net/socket.c")
-          if (skbuff_c.exists() and socket_c.exists()
-                  and "sock_rmem_free" in socket_c.read_text(errors="replace")):
-              sc = skbuff_c.read_text(errors="replace")
-              new, n = re.subn(r"\bstatic\s+void\s+sock_rmem_free\s*\(",
-                               "void sock_rmem_free(", sc)
-              if n:
-                  skbuff_c.write_text(new)
-                  changed.append(
-                      f"skbuff.c: made sock_rmem_free() global ({n} definition)")
-
-          if changed:
-              fixes.write_text("\n".join(changed) + "\n")
-              print("\n".join(changed))
-          else:
-              print("No vendor/CIP API normalization needed")
-          PY
-
-          if [[ -s "$FIXES" ]]; then
-            {
-              echo "=== Applied vendor/CIP API compatibility fixes ==="
-              cat "$FIXES"
-            } 2>&1 | tee -a "$LOG_FILE"
-          fi
-
-      - name: Build kernel
-        id: build
-        run: |
-          set -euo pipefail
-          cd kernel
-
-          MAKE_ARGS=(
-            -j"$(nproc)"
-            O=../out
-            ARCH=arm64
-            LLVM=1
-            LLVM_IAS=1
-            CC="${LLVM_DIR}/clang"
-            LD="${LLVM_DIR}/ld.lld"
-            AR="${LLVM_DIR}/llvm-ar"
-            NM="${LLVM_DIR}/llvm-nm"
-            OBJCOPY="${LLVM_DIR}/llvm-objcopy"
-            OBJDUMP="${LLVM_DIR}/llvm-objdump"
-            READELF="${LLVM_DIR}/llvm-readelf"
-            STRIP="${LLVM_DIR}/llvm-strip"
-            CROSS_COMPILE="${CROSS_COMPILE}"
-          )
-
-          {
-            echo "=== make ${DEFCONFIG} ==="
-            make "${MAKE_ARGS[@]}" "${DEFCONFIG}"
-            echo "=== make Image.gz-dtb ==="
-            make "${MAKE_ARGS[@]}" Image.gz-dtb
-            ls -lh ../out/arch/arm64/boot/Image.gz-dtb
-          } 2>&1 | tee -a "$LOG_FILE"
-
-          BASE_VER="$(awk '/^VERSION/ {v=$3} /^PATCHLEVEL/ {p=$3} /^SUBLEVEL/ {s=$3} END {print v"."p"."s}' Makefile)"
-          LV="$(grep '^CONFIG_LOCALVERSION=' ../out/.config | head -1 | cut -d= -f2- | tr -d '\"')"
-          CIP_LV="$(cat localversion-cip 2>/dev/null || true)"
-          ST_LV="$(cat localversion-st 2>/dev/null || true)"
-          FULL_REL="${BASE_VER}${LV}${CIP_LV}${ST_LV}"
-          echo "kernel_version=${FULL_REL}" >> "$GITHUB_OUTPUT"
-          echo "uname -r will be: ${FULL_REL}-g<sha>"
-
-      - name: Package flashable AnyKernel3 zip
-        id: package
-        run: |
-          set -euo pipefail
-
-          KVER="${{ steps.build.outputs.kernel_version }}"
-          SHORT_SHA="$(git -C kernel rev-parse --short HEAD)"
-          DATE="$(date +%Y%m%d)"
-          ZIP_NAME="kernel-earth-${KVER}-${DATE}-${SHORT_SHA}.zip"
-
-          git clone --depth 1 "${AK3_REPO}" anykernel
-          rm -rf anykernel/.git
-          cp out/arch/arm64/boot/Image.gz-dtb anykernel/Image.gz-dtb
-
-          cat > anykernel/anykernel.sh <<'AK3EOF'
-          ### AnyKernel3 Ramdisk Mod Script
-          ## osm0sis @ xda-developers
-
-          ### AnyKernel setup
-          properties() { '
-          kernel.string=Earth Kernel
-          do.devicecheck=1
-          do.modules=0
-          do.systemless=1
-          do.cleanup=1
-          do.cleanuponabort=0
-          device.name1=earth
-          device.name2=
-          device.name3=
-          device.name4=
-          device.name5=
-          supported.versions=
-          supported.patchlevels=
-          '; }
-
-          ### AnyKernel install
-          BLOCK=/dev/block/by-name/boot;
-          IS_SLOT_DEVICE=auto;
-          RAMDISK_COMPRESSION=auto;
-          PATCH_VBMETA_FLAG=auto;
-
-          . tools/ak3-core.sh;
-
-          dump_boot;
-          write_boot;
-          AK3EOF
-
-          sed -i "s|^kernel.string=.*|kernel.string=Earth ${KVER} (LineageOS 23.2 / CIP 4.19.y) - ${SHORT_SHA}|" anykernel/anykernel.sh
-
-          (
-            cd anykernel
-            zip -r9 "../${ZIP_NAME}" . -x '*.md'
-          )
-
-          unzip -t "${ZIP_NAME}" >/dev/null
-          echo "zip=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
-          echo "kver=${KVER}" >> "$GITHUB_OUTPUT"
-          echo "sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
-          echo "size=$(du -h "${ZIP_NAME}" | cut -f1)" >> "$GITHUB_OUTPUT"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-earth-${{ steps.package.outputs.kver }}-${{ steps.package.outputs.sha }}
-          path: |
-            ${{ steps.package.outputs.zip }}
-            out/arch/arm64/boot/Image.gz-dtb
-            out/.config
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Generate release notes and job summary
-        id: notes
-        run: |
-          set -e
-          SKIPPED=0
-          if [[ -f "$GITHUB_WORKSPACE/cip-skipped.txt" ]]; then
-            SKIPPED="$(wc -l < "$GITHUB_WORKSPACE/cip-skipped.txt" | tr -d ' ')"
-          fi
-          FIXED=0
-          if [[ -f "$GITHUB_WORKSPACE/cip-fixes.txt" ]]; then
-            FIXED="$(wc -l < "$GITHUB_WORKSPACE/cip-fixes.txt" | tr -d ' ')"
-          fi
-          cat > release_notes.md <<EOF
-          ## Kernel Redmi 12C / POCO C55 (earth) — CIP 4.19.y
-
-          - **Release:** \`${{ steps.package.outputs.kver }}\`
-          - **Base:** LineageOS \`lineage-23.2\` (commit \`${{ steps.package.outputs.sha }}\`)
-          - **CIP merge:** \`${{ steps.cip.outputs.source }}\` → \`${{ steps.cip.outputs.target }}\`
-            (localversion: \`${{ steps.cip.outputs.cip_suffix }}\` \`${{ steps.cip.outputs.st_suffix }}\`)
-          - **CIP files skipped (vendor conflicts):** ${SKIPPED}
-          - **Vendor/CIP API compatibility fixes:** ${FIXED}
-          - **Defconfig:** \`${DEFCONFIG}\`
-          - **Toolchain:** Clang 17 + LLD, CROSS_COMPILE=\`${CROSS_COMPILE}\`
-          - **Zip:** \`${{ steps.package.outputs.zip }}\` (${{ steps.package.outputs.size }})
-
-          ### Flash
-          1. Boot into LineageOS Recovery (or TWRP/OrangeFox).
-          2. Apply Update / Install → sideload or select the zip.
-          3. Wipe cache/dalvik if needed, then reboot.
-
-          > Patches are taken directly from CIP GitLab. No fork is created.
-          > Files that conflict with the vendor tree are skipped and listed below.
-          EOF
-
-          if [[ "${SKIPPED}" -gt 0 ]]; then
-            {
-              echo
-              echo "### Skipped CIP files (vendor conflicts)"
-              sed 's/^/- /' "$GITHUB_WORKSPACE/cip-skipped.txt"
-            } >> release_notes.md
-          fi
-          if [[ "${FIXED}" -gt 0 ]]; then
-            {
-              echo
-              echo "### Vendor/CIP API compatibility fixes"
-              sed 's/^/- /' "$GITHUB_WORKSPACE/cip-fixes.txt"
-            } >> release_notes.md
-          fi
-
-          cat release_notes.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.package.outputs.kver }}-${{ steps.package.outputs.date }}-${{ steps.package.outputs.sha }}
-          name: Earth Kernel ${{ steps.package.outputs.kver }} (${{ steps.package.outputs.date }})
-          body_path: release_notes.md
-          files: ${{ steps.package.outputs.zip }}
-          make_latest: true
-          fail_on_unmatched_files: true
-
-      - name: Collect failure log
-        if: failure()
-        run: |
           set +e
-          OUT="$GITHUB_WORKSPACE/log.txt"
-          {
-            echo "=== Run info ==="
-            echo "repo : ${GITHUB_REPOSITORY}"
-            echo "run  : ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT}"
-            echo "event: ${GITHUB_EVENT_NAME}  ref: ${GITHUB_REF}"
-            echo "time : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            echo
-            echo "=== Captured build / patch log ==="
-            if [[ -f "$LOG_FILE" ]]; then
-              cat "$LOG_FILE"
-            else
-              echo "(no captured log yet)"
-            fi
-            echo
-            echo "=== CIP files skipped (vendor conflicts) ==="
-            if [[ -f "$GITHUB_WORKSPACE/cip-skipped.txt" ]]; then
-              cat "$GITHUB_WORKSPACE/cip-skipped.txt"
-            else
-              echo "(none)"
-            fi
-            echo
-            echo "=== Vendor/CIP API compatibility fixes ==="
-            if [[ -f "$GITHUB_WORKSPACE/cip-fixes.txt" ]]; then
-              cat "$GITHUB_WORKSPACE/cip-fixes.txt"
-            else
-              echo "(none)"
-            fi
-            echo
-            echo "=== Kernel tree status (first 100) ==="
-            git -C "$GITHUB_WORKSPACE/kernel" status --short 2>/dev/null | head -100
-            echo
-            echo "=== Workspace layout / disk ==="
-            find "$GITHUB_WORKSPACE" -maxdepth 2 -type d 2>/dev/null | head -40
-            df -h "$GITHUB_WORKSPACE"
-          } > "$OUT" 2>&1
-          echo "log.txt: $(wc -l < "$OUT") lines, $(du -h "$OUT" | cut -f1)"
-          echo "=== tail of log.txt for quick triage ==="
-          tail -80 "$OUT" >> "$GITHUB_STEP_SUMMARY"
+          git merge-tree --write-tree --merge-base="$BASE_SYN" \
+            "$OURS_SYN" "$THEIRS_SYN" > "$TMP/merge.out"
+          MERGE_RC=$?
+          set -e
+          [ "$MERGE_RC" -le 1 ] || fail "git merge-tree failed with status $MERGE_RC"
 
-      - name: Upload failure log (log.txt)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: earth-failure-log-${{ github.run_id }}-${{ github.run_attempt }}
-          path: log.txt
-          if-no-files-found: warn
-          retention-days: 30
+          MERGED_TREE="$(head -n1 "$TMP/merge.out")"
+          git cat-file -e "$MERGED_TREE^{tree}" || fail "merge-tree produced no tree"
+
+          cat > "$TMP/expected.txt" <<'EOF'
+          drivers/gpu/drm/virtio/virtgpu_ioctl.c
+          drivers/input/evdev.c
+          drivers/net/ethernet/stmicro/stmmac/dwxgmac2.h
+          drivers/net/ethernet/stmicro/stmmac/ring_mode.c
+          drivers/usb/gadget/function/f_fs.c
+          drivers/usb/gadget/function/f_hid.c
+          drivers/usb/gadget/udc/core.c
+          drivers/usb/host/xhci-hub.c
+          fs/Makefile
+          fs/f2fs/super.c
+          fs/f2fs/sysfs.c
+          fs/jbd2/transaction.c
+          include/linux/bpf.h
+          include/linux/fs.h
+          include/net/sock.h
+          kernel/bpf/core.c
+          kernel/bpf/local_storage.c
+          kernel/sched/core.c
+          kernel/sched/cpufreq_schedutil.c
+          mm/swapfile.c
+          net/core/filter.c
+          sound/core/pcm_lib.c
+          virt/kvm/arm/mmu.c
+          EOF
+          grep -E '^[0-7]{6} ' "$TMP/merge.out" | cut -f2 | sort -u > "$TMP/actual.txt"
+          sort -u "$TMP/expected.txt" > "$TMP/expected.sorted.txt"
+          if ! diff -u "$TMP/expected.sorted.txt" "$TMP/actual.txt" > "$TMP/conflict.diff"; then
+            cat "$TMP/conflict.diff" >&2
+            fail "unexpected conflict set; do not reuse these resolutions for this tag"
+          fi
+          log "all $(wc -l < "$TMP/actual.txt") conflicts are covered by inline resolutions"
+
+          git read-tree --reset -u "$MERGED_TREE"
+          export CONFLICT_LIST="$TMP/expected.txt"
+
+          python3 - <<'PY'
+          import os
+          import re
+
+          CUSTOM = lambda s: ("custom", s)
+
+          # One entry per conflict hunk, in file order.
+          ACTIONS = {
+              "drivers/gpu/drm/virtio/virtgpu_ioctl.c": [
+                  CUSTOM("\t\tdrm_gem_object_put_unlocked(obj);\n"),
+              ],
+              "drivers/input/evdev.c": [
+                  CUSTOM("\tmemset(&ev, 0, sizeof(ev));\n"),
+              ],
+              "drivers/net/ethernet/stmicro/stmmac/dwxgmac2.h": [
+                  CUSTOM("#define XGMAC_DMA_INT_DEFAULT_EN\t(XGMAC_NIE | XGMAC_AIE | XGMAC_RIE | \\\n"
+                         "\t\t\t\t\tXGMAC_TBUE | XGMAC_TIE)\n"),
+              ],
+              "drivers/net/ethernet/stmicro/stmmac/ring_mode.c": [
+                  "theirs",
+              ],
+              "drivers/usb/gadget/function/f_fs.c": [
+                  CUSTOM("\t/* to get updated opened atomic variable value */\n"
+                         "\tsmp_mb__before_atomic();\n"
+                         "\tatomic_set(&epfile->opened, 0);\n"
+                         "\tatomic_set(&epfile->error, 1);\n"),
+              ],
+              "drivers/usb/gadget/function/f_hid.c": [
+                  CUSTOM("\t/* HACK, replace content, duplicate code from above */\n"
+                         "\thidg->bInterfaceSubClass = hid_data.subclass;\n"
+                         "\thidg->bInterfaceProtocol = hid_data.protocol;\n"
+                         "\thidg->report_length = hid_data.report_length;\n"
+                         "\thidg->report_desc_length = hid_data.report_desc_length;\n"
+                         "\thidg->report_desc = kmemdup(hid_data.report_desc,\n"
+                         "\t\t\thid_data.report_desc_length,\n"
+                         "\t\t\tGFP_KERNEL);\n"
+                         "\tif (!hidg->report_desc) {\n"
+                         "\t\tkfree(hidg);\n"
+                         "\t\tmutex_unlock(&opts->lock);\n"
+                         "\t\treturn ERR_PTR(-ENOMEM);\n"
+                         "\t}\n"
+                         "\n"
+                         "\t++opts->refcnt;\n"),
+              ],
+              "drivers/usb/gadget/udc/core.c": [
+                  CUSTOM("\tsysfs_remove_link(&udc->dev.kobj, \"gadget\");\n"
+                         "\n"
+                         "\t/*\n"
+                         "\t * Set the teardown flag before flushing the work to prevent new work\n"
+                         "\t * from being scheduled while we are cleaning up.\n"
+                         "\t */\n"
+                         "\tspin_lock_irqsave(&gadget->state_lock, flags);\n"
+                         "\tgadget->teardown = true;\n"
+                         "\tspin_unlock_irqrestore(&gadget->state_lock, flags);\n"),
+              ],
+              "drivers/usb/host/xhci-hub.c": [
+                  "ours",
+              ],
+              "fs/Makefile": [
+                  CUSTOM("\t\tfs_types.o fs_context.o fs_parser.o\n"),
+              ],
+              "fs/f2fs/super.c": [
+                  CUSTOM("\n"
+                         "\t\tif (err > 0) {\n"
+                         "\t\t\tif (!f2fs_readonly(sb)) {\n"
+                         "\t\t\t\tf2fs_err(sbi, \"Need to recover fsync data\");\n"
+                         "\t\t\t\terr = -EINVAL;\n"
+                         "\t\t\t\tgoto free_meta;\n"
+                         "\t\t\t} else {\n"
+                         "\t\t\t\tf2fs_info(sbi, \"drop all fsynced data\");\n"
+                         "\t\t\t\terr = 0;\n"
+                         "\t\t\t}\n"),
+              ],
+              "fs/f2fs/sysfs.c": [
+                  "both",
+                  CUSTOM("static void __sbi_store_value(struct f2fs_attr *a,\n"
+                         "\t\t\tstruct f2fs_sb_info *sbi,\n"
+                         "\t\t\tunsigned char *ui, unsigned long value)\n"
+                         "{\n"
+                         "\tswitch (a->size) {\n"
+                         "\tcase 1:\n"
+                         "\t\t*(u8 *)ui = value;\n"
+                         "\t\tbreak;\n"
+                         "\tcase 2:\n"
+                         "\t\t*(u16 *)ui = value;\n"
+                         "\t\tbreak;\n"
+                         "\tcase 4:\n"
+                         "\t\t*(u32 *)ui = value;\n"
+                         "\t\tbreak;\n"
+                         "\tcase 8:\n"
+                         "\t\t*(u64 *)ui = value;\n"
+                         "\t\tbreak;\n"
+                         "\tdefault:\n"
+                         "\t\tf2fs_bug_on(sbi, 1);\n"
+                         "\t\tf2fs_err(sbi, \"store sysfs node value with wrong type\");\n"
+                         "\t}\n"),
+                  CUSTOM("\tif (!strcmp(a->attr.name, \"iostat_period_ms\")) {\n"
+                         "\t\tif (t < MIN_IOSTAT_PERIOD_MS || t > MAX_IOSTAT_PERIOD_MS)\n"
+                         "\t\t\treturn -EINVAL;\n"
+                         "\t\tspin_lock(&sbi->iostat_lock);\n"
+                         "\t\tsbi->iostat_period_ms = (unsigned int)t;\n"
+                         "\t\tspin_unlock(&sbi->iostat_lock);\n"
+                         "\t\treturn count;\n"
+                         "\t}\n"
+                         "\n"
+                         "\t__sbi_store_value(a, sbi, ptr + a->offset, t);\n"),
+              ],
+              "fs/jbd2/transaction.c": [
+                  "theirs",
+              ],
+              "include/linux/bpf.h": [
+                  "ours",
+              ],
+              "include/linux/fs.h": [
+                  CUSTOM("#include <linux/android_kabi.h>\n"
+                         "#include <linux/fs_types.h>\n"),
+              ],
+              "include/net/sock.h": [
+                  CUSTOM("#if IS_ENABLED(CONFIG_DEBUG_SPINLOCK) || IS_ENABLED(CONFIG_DEBUG_LOCK_ALLOC)\n"
+                         "\tANDROID_KABI_RESERVE(1);\n"
+                         "#else\n"
+                         "\tANDROID_KABI_USE(1, spinlock_t sk_peer_lock);\n"
+                         "#endif\n"
+                         "\tANDROID_KABI_RESERVE(2);\n"
+                         "\tANDROID_KABI_RESERVE(3);\n"
+                         "\tANDROID_KABI_RESERVE(4);\n"
+                         "\tANDROID_KABI_RESERVE(5);\n"
+                         "\tANDROID_KABI_RESERVE(6);\n"
+                         "\tANDROID_KABI_RESERVE(7);\n"
+                         "\tANDROID_KABI_RESERVE(8);\n"
+                         "#if IS_ENABLED(CONFIG_PROVE_LOCKING) && IS_ENABLED(CONFIG_MODULES)\n"
+                         "\tstruct module\t\t*sk_owner;\n"
+                         "#endif\n"),
+              ],
+              "kernel/bpf/core.c": [
+                  "ours",
+              ],
+              "kernel/bpf/local_storage.c": [
+                  "ours",
+              ],
+              "kernel/sched/core.c": [
+                  CUSTOM("void sched_post_fork(struct task_struct *p)\n"
+                         "{\n"
+                         "\tuclamp_post_fork(p);\n"
+                         "}\n"
+                         "\n"
+                         "u64 to_ratio(u64 period, u64 runtime)\n"),
+              ],
+              "kernel/sched/cpufreq_schedutil.c": [
+                  CUSTOM("\tlist_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {\n"
+                         "\t\tsg_policy->up_rate_delay_ns = (s64)rate_limit_us * NSEC_PER_USEC;\n"
+                         "\t\tupdate_min_rate_limit_ns(sg_policy);\n"
+                         "\t}\n"),
+                  CUSTOM("\tsg_policy->up_rate_delay_ns =\n"
+                         "\t\t(s64)sg_policy->tunables->up_rate_limit_us * NSEC_PER_USEC;\n"
+                         "\tsg_policy->down_rate_delay_ns =\n"
+                         "\t\t(s64)sg_policy->tunables->down_rate_limit_us * NSEC_PER_USEC;\n"
+                         "\tupdate_min_rate_limit_ns(sg_policy);\n"),
+              ],
+              "mm/swapfile.c": [
+                  CUSTOM("\tinode_lock(inode);\n"
+                         "\tif (IS_SWAPFILE(inode)) {\n"
+                         "\t\terror = -EBUSY;\n"
+                         "\t\tgoto bad_swap_unlock_inode;\n"
+                         "\t}\n"
+                         "\tif (IS_ENCRYPTED(inode)) {\n"
+                         "\t\tpr_warn_once(\n"
+                         "\t\t\t\"Filesystem-level encrypted swapfile '%s' is unsupported. Create a loop device over it, or use dm-crypt\\n\",\n"
+                         "\t\t\tname->name);\n"
+                         "\t\terror = -EINVAL;\n"
+                         "\t\tgoto bad_swap_unlock_inode;\n"
+                         "\t}\n"),
+              ],
+              "net/core/filter.c": [
+                  "ours",
+                  "ours",
+              ],
+              "sound/core/pcm_lib.c": [
+                  "theirs",
+              ],
+              "virt/kvm/arm/mmu.c": [
+                  CUSTOM("\n"
+                         "\t/*\n"
+                         "\t * Read mmu_notifier_seq while still holding mmap_sem so that KVM can\n"
+                         "\t * detect if the results of find_vma_intersection() (e.g. the huge\n"
+                         "\t * page decision above) or gfn_to_pfn_prot() become stale prior to\n"
+                         "\t * acquiring kvm->mmu_lock.  A competing VMA change has to take\n"
+                         "\t * mmap_sem for write and the mmu notifier bumps mmu_notifier_seq\n"
+                         "\t * under kvm->mmu_lock, so mmu_notifier_retry() will notice any\n"
+                         "\t * change made once we drop mmap_sem.\n"
+                         "\t */\n"
+                         "\tmmu_seq = vcpu->kvm->mmu_notifier_seq;\n"
+                         "\tmmap_read_unlock(current->mm);\n"),
+              ],
+          }
+
+          MARKER = re.compile(
+              r"^<<<<<<<[^\n]*\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*\n",
+              re.MULTILINE | re.DOTALL,
+          )
+
+          def resolve(path, actions):
+              with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+                  text = f.read()
+              matches = list(MARKER.finditer(text))
+              if len(matches) != len(actions):
+                  raise SystemExit(
+                      "%s: expected %d hunks, found %d" % (path, len(actions), len(matches))
+                  )
+              counter = iter(range(len(matches)))
+
+              def repl(m):
+                  action = actions[next(counter)]
+                  if action == "ours":
+                      return m.group(1)
+                  if action == "theirs":
+                      return m.group(2)
+                  if action == "both":
+                      return m.group(1) + m.group(2)
+                  if isinstance(action, tuple) and action[0] == "custom":
+                      return action[1]
+                  raise SystemExit("%s: bad action %r" % (path, action))
+
+              new = MARKER.sub(repl, text)
+              if "<<<<<<<" in new or ">>>>>>>" in new:
+                  raise SystemExit("%s: markers remain after resolution" % path)
+              with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+                  f.write(new)
+              print("[cip-merge] resolved %s (%d hunk(s))" % (path, len(matches)))
+
+          with open(os.environ["CONFLICT_LIST"], "r", encoding="utf-8") as f:
+              paths = [line.strip() for line in f if line.strip()]
+
+          for path in paths:
+              if path not in ACTIONS:
+                  raise SystemExit("no inline resolution for %s" % path)
+              resolve(path, ACTIONS[path])
+
+          # Apply CIP's 64-bit overflow fix inside the vendor scheduler layout.
+          cpu = "kernel/sched/cpufreq_schedutil.c"
+          with open(cpu, "r", encoding="utf-8") as f:
+              s = f.read()
+          helper = ("static void sugov_update_rate_limit_us(struct sugov_policy *sg_policy)\n"
+                    "{\n"
+                    "\t/*\n"
+                    "\t * Cast rate_limit_us before multiplication to force 64-bit arithmetic.\n"
+                    "\t * Otherwise, on 32-bit platforms, both operands are converted to\n"
+                    "\t * 32-bit unsigned long and the multiplication may overflow.\n"
+                    "\t */\n"
+                    "\tsg_policy->freq_update_delay_ns =\n"
+                    "\t\t(s64)sg_policy->tunables->rate_limit_us * NSEC_PER_USEC;\n"
+                    "}\n\n")
+          if helper not in s:
+              raise SystemExit("cpufreq helper block not found")
+          s = s.replace(helper, "", 1)
+          s = s.replace("sg_policy->up_rate_delay_ns = rate_limit_us * NSEC_PER_USEC;",
+                        "sg_policy->up_rate_delay_ns = (s64)rate_limit_us * NSEC_PER_USEC;")
+          s = s.replace("sg_policy->down_rate_delay_ns = rate_limit_us * NSEC_PER_USEC;",
+                        "sg_policy->down_rate_delay_ns = (s64)rate_limit_us * NSEC_PER_USEC;")
+          s = re.sub(r"(?<!\(s64\))(?<!\w)(sg_policy->tunables->(?:up|down)_rate_limit_us \* NSEC_PER_USEC)",
+                     r"(s64)\1", s)
+          s = re.sub(r"(?<!\(s64\))(?<!\w)(rate_limit_us \* NSEC_PER_USEC)",
+                     r"(s64)\1", s)
+          s = s.replace("(s64)(s64)", "(s64)")
+          with open(cpu, "w", encoding="utf-8") as f:
+              f.write(s)
+          print("[cip-merge] applied CIP rate-limit overflow fix")
+          PY
+
+          printf '%s\n' "$TARGET_CIP" > localversion-cip
+          printf '%s\n' "$TARGET_ST" > localversion-st
+
+          log "running sanity checks"
+          while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            if grep -nE '^(<<<<<<<|=======|>>>>>>>) ' "$path"; then
+              fail "unresolved merge marker in $path"
+            fi
+          done < "$TMP/expected.txt"
+
+          [ "$(make -s kernelversion)" = "4.19.325" ] || fail "kernelversion changed unexpectedly"
+          [ "$(cat localversion-cip)" = "$TARGET_CIP" ] || fail "localversion-cip mismatch"
+          [ "$(cat localversion-st)" = "$TARGET_ST" ] || fail "localversion-st mismatch"
+
+          git add -A
+          if ! git diff --check --cached > "$TMP/whitespace.txt"; then
+            warn "git diff --check reported whitespace issues (informational only):"
+            sed 's/^/  /' "$TMP/whitespace.txt"
+          fi
+
+          TREE="$(git write-tree)"
+          MSG="$(cat <<EOF
+          Merge $CIP_TARGET_TAG into $SOURCE_BRANCH
+
+          CIP: $CIP_BASE_TAG -> $CIP_TARGET_TAG (localversion-st $TARGET_ST)
+          All 23 conflicts resolved by the inline rules in this workflow.
+          EOF
+          )"
+          NEW_COMMIT="$(printf '%s\n' "$MSG" \
+            | git commit-tree "$TREE" -p "$OURS" -p "$CIP_TARGET")"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            log "dry run: would create merge commit $NEW_COMMIT on $TARGET_BRANCH"
+            log "dry run: skipping push and pull request"
+            exit 0
+          fi
+
+          git update-ref "refs/heads/$TARGET_BRANCH" "$NEW_COMMIT"
+          git push --force origin "$NEW_COMMIT:refs/heads/$TARGET_BRANCH"
+          log "pushed $TARGET_BRANCH ($NEW_COMMIT)"
+
+          if [ "$OPEN_PR" = "true" ]; then
+            PR_COUNT="$(gh pr list --head "$TARGET_BRANCH" --base "$SOURCE_BRANCH" \
+              --json number --jq 'length')"
+            if [ "$PR_COUNT" != "0" ]; then
+              log "pull request for $TARGET_BRANCH already exists"
+            else
+              cat > "$TMP/pr.md" <<EOF
+          Automated merge of \`$CIP_TARGET_TAG\` (CIP $TARGET_CIP / ST $TARGET_ST) into \`$SOURCE_BRANCH\`.
+
+          - Merge base: \`$CIP_BASE_TAG\`, matching the localversion files on \`$SOURCE_BRANCH\`.
+          - 23 conflicts resolved by inline rules in the workflow; see the workflow source for rationale.
+          - No conflict markers remain; \`make kernelversion\` reports 4.19.325.
+          - Please review vendor-specific resolutions (MediaTek, sdcardfs, uclamp, BPF) before merging.
+          EOF
+              gh pr create --base "$SOURCE_BRANCH" --head "$TARGET_BRANCH" \
+                --title "Merge $CIP_TARGET_TAG into $SOURCE_BRANCH" \
+                --body-file "$TMP/pr.md"
+              log "opened pull request"
+            fi
+          fi
+
+          log "done"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### CIP merge" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source: \`${{ inputs.source-branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Target: \`${{ inputs.target-branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- CIP: \`${{ inputs.cip-base-tag }}\` -> \`${{ inputs.cip-target-tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Conflicts: 23, resolved inline (no extra files needed)" >> "$GITHUB_STEP_SUMMARY"

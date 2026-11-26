@@ -398,8 +398,9 @@ jobs:
               '\t\tif (err > 0) {\n\t\t\tif (!f2fs_readonly(sb)) {\n'
               '\t\t\t\tf2fs_err(sbi, "Need to recover fsync data");\n'
               '\t\t\t\terr = -EINVAL;\n\t\t\t\tgoto free_meta;\n'
-              '\t\t\t} else {\n\t\t\t\tf2fs_msg(sb, KERN_INFO, "drop all fsynced data");\n'
-              '\t\t\t\terr = 0;\n\t\t\t}\n\t\t}\n')],
+              '\t\t\t} else {\n'
+              '\t\t\t\tf2fs_err(sbi, "drop all fsynced data (readonly)");\n'
+              '\t\t\t\terr = 0;\n\t\t\t}')],
           'fs/f2fs/sysfs.c':[
             r('avg_vblocks_show','both'),
             r('return sprintf(buf, "%u\\n", *ui);','theirs'),
@@ -431,8 +432,8 @@ jobs:
               'void sched_post_fork(struct task_struct *p)\n{\n\tuclamp_post_fork(p);\n}\n\n'
               'u64 to_ratio(u64 period, u64 runtime)\n')],
           'kernel/sched/cpufreq_schedutil.c':[
-            r('sg_policy->up_rate_delay_ns','ours'),
-            r('sugov_update_rate_limit_us(sg_policy);','ours')],
+            # pakai helper ala CIP, lalu POST-fix isinya dengan field vendor
+            r('sugov_update_rate_limit_us(sg_policy);','theirs')],
           'mm/swapfile.c':[r('IS_SWAPFILE(inode)','text',
               '\tinode_lock(inode);\n\tif (IS_SWAPFILE(inode)) {\n'
               '\t\terror = -EBUSY;\n\t\tgoto bad_swap_unlock_inode;\n\t}\n'
@@ -451,6 +452,24 @@ jobs:
           'drivers/net/ethernet/stmicro/stmmac/ring_mode.c':[
             ('static void refill_desc3(void *priv_ptr, struct dma_desc *p)',
              'static void refill_desc3(struct stmmac_rx_queue *rx_q, struct dma_desc *p)')],
+          # vendor f2fs helper: f2fs_err(sbi, ...) ada, f2fs_msg(sb, ...) tidak ada
+          'fs/f2fs/super.c':[
+            ('reset_checkpoint:\n\t/* f2fs_recover_fsync_data() cleared this already */',
+             'reset_checkpoint:\n\tskip_recovery:\n'
+             '\t/* f2fs_recover_fsync_data() cleared this already */'),
+            ('f2fs_msg(sbi->sb, KERN_ERR,', 'f2fs_err(sbi,'),
+            ('f2fs_msg(sbi->sb, KERN_INFO,', 'f2fs_err(sbi,'),
+            ('f2fs_msg(sb, KERN_ERR,', 'f2fs_err(sbi,'),
+            ('f2fs_msg(sb, KERN_INFO,', 'f2fs_err(sbi,')],
+          'fs/f2fs/sysfs.c':[
+            ('f2fs_msg(sbi->sb, KERN_ERR,', 'f2fs_err(sbi,'),
+            ('f2fs_msg(sbi->sb, KERN_INFO,', 'f2fs_err(sbi,'),
+            ('f2fs_msg(sb, KERN_ERR,', 'f2fs_err(sbi,'),
+            ('f2fs_msg(sb, KERN_INFO,', 'f2fs_err(sbi,')],
+          # schedutil: pakai nama field vendor/MediaTek, bukan CIP murni
+          'kernel/sched/cpufreq_schedutil.c':[
+            ('freq_update_delay_ns', 'up_rate_delay_ns'),
+            ('tunables->rate_limit_us', 'tunables->up_rate_limit_us')],
           }
           def render(k, o, t, v):
               if k == 'ours': return o
@@ -485,6 +504,24 @@ jobs:
                   s = p.read_text()
                   for a, b in subs: s = s.replace(a, b)
                   p.write_text(s)
+          # CIP memanggil sugov_update_rate_limit_us(); pastikan helper itu ada
+          # dan memakai field vendor (up_rate_limit_us / up_rate_delay_ns).
+          p = R / 'kernel/sched/cpufreq_schedutil.c'
+          if p.is_file():
+              s = p.read_text()
+              if ('sugov_update_rate_limit_us(' in s and
+                  'void sugov_update_rate_limit_us(' not in s):
+                  anchor = 'static void sugov_update_single('
+                  helper = (
+                      'static inline void sugov_update_rate_limit_us('
+                      'struct sugov_policy *sg_policy)\n{\n'
+                      '\tsg_policy->up_rate_delay_ns =\n'
+                      '\t\tsg_policy->tunables->up_rate_limit_us * NSEC_PER_USEC;\n'
+                      '\tupdate_min_rate_limit_ns(sg_policy);\n}\n\n')
+                  if anchor in s:
+                      s = s.replace(anchor, helper + anchor, 1)
+                      p.write_text(s)
+                      print('POST-FIX: sugov_update_rate_limit_us helper')
           if bad:
               print('\n'.join(bad)); sys.exit(1)
           print('AUTO_RESOLVE_OK')

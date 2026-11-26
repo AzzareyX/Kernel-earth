@@ -463,16 +463,22 @@ jobs:
               if not p.is_file():
                   bad.append('MISSING ' + path); continue
               s = p.read_text(); ms = list(P.finditer(s))
-              if not ms: continue
-              out = []; pos = 0
+              if not ms:
+                  print('SKIP (no markers): ' + path); continue
+              out = []; pos = 0; handled = 0
               for m in ms:
                   o, t = m.group(1), m.group(2)
                   pick = next(((k, v) for n, k, v in rules if n in o + t), None)
                   if pick is None:
-                      bad.append('UNHANDLED ' + path); continue
+                      bad.append('UNHANDLED %s: %s' % (
+                          path, m.group(0)[:200].replace('\n', '\\n')))
+                      continue
+                  handled += 1
                   out += [s[pos:m.start()], render(pick[0], o, t, pick[1])]
                   pos = m.end()
-              out.append(s[pos:]); p.write_text(''.join(out))
+              if handled == len(ms):
+                  out.append(s[pos:]); p.write_text(''.join(out))
+                  print('OK %s: %d/%d block(s)' % (path, handled, len(ms)))
           for path, subs in POST.items():
               p = R / path
               if p.is_file():
@@ -490,24 +496,47 @@ jobs:
             RESOLVER_RC=1
           fi
 
-          UNMERGED="$(git diff --name-only --diff-filter=U | wc -l)"
+          # PENTING: daftar unmerged harus diambil SEBELUM `git add`.
+          # Setelah di-add, `git diff --diff-filter=U` selalu 0 dan tidak bisa
+          # dipakai sebagai indikator keberhasilan resolver.
+          UNMERGED_PATHS="$(git diff --name-only --diff-filter=U)"
+          UNMERGED_BEFORE="$(printf '%s\n' "$UNMERGED_PATHS" | grep -c . || true)"
           MARKERS=0
-          for f in $(git diff --name-only --diff-filter=U); do
+          for f in $UNMERGED_PATHS; do
             if grep -q -E '^(<<<<<<< HEAD|=======|>>>>>>>)' "$f"; then
               MARKERS=$((MARKERS + 1))
             fi
           done
-          {
-            echo "resolver_rc=$RESOLVER_RC"
-            echo "unmerged_paths=$UNMERGED"
-            echo "files_with_markers=$MARKERS"
-          } > "$CONFLICT_DIR/10-resolve-check.txt" || true
 
           FINAL=ok
-          if [ "$RESOLVER_RC" -ne 0 ] || [ "$UNMERGED" -ne 0 ] || [ "$MARKERS" -ne 0 ]; then
+          UNMERGED_AFTER="$UNMERGED_BEFORE"
+          if [ "$RESOLVER_RC" -ne 0 ] || [ "$MARKERS" -ne 0 ]; then
             FINAL=failed
           else
+            # Resolver sudah menimpa file working tree; stage dulu resolusinya.
             git add -A
+            UNMERGED_AFTER="$(git diff --name-only --diff-filter=U | wc -l)"
+            CACHED_CHECK="$CONFLICT_DIR/11-diff-check-cached.txt"
+            git diff --check --cached 2>&1 | head -n 200 > "$CACHED_CHECK" || true
+            git diff --cached --stat 2>/dev/null | tail -n 60 \
+              > "$CONFLICT_DIR/12-resolved-stat.txt" || true
+            if [ "$UNMERGED_AFTER" -ne 0 ] || grep -q 'leftover conflict marker' "$CACHED_CHECK"; then
+              FINAL=failed
+            elif [ -s "$CACHED_CHECK" ]; then
+              echo "::warning::Ada whitespace warning setelah resolusi; lihat 11-diff-check-cached.txt"
+            fi
+          fi
+
+          {
+            echo "resolver_rc=$RESOLVER_RC"
+            echo "unmerged_paths_before_add=$UNMERGED_BEFORE"
+            echo "files_with_markers=$MARKERS"
+            echo "unmerged_paths_after_add=$UNMERGED_AFTER"
+            echo "unmerged_paths=$UNMERGED_AFTER"
+            echo "final=$FINAL"
+          } > "$CONFLICT_DIR/10-resolve-check.txt" || true
+
+          if [ "$FINAL" = "ok" ]; then
             if [ "$MERGE_MODE" = "merge" ]; then
               git -c core.editor=true merge --continue
             elif [ "$MERGE_MODE" = "rebase" ]; then
@@ -517,6 +546,10 @@ jobs:
               git -c core.editor=true cherry-pick --quit >/dev/null 2>&1 || true
             fi
             [ "$(git diff --name-only --diff-filter=U | wc -l)" -eq 0 ] || FINAL=failed
+            if [ "$FINAL" != "ok" ]; then
+              echo "final=failed (setelah merge --continue masih ada path unmerged)" \
+                >> "$CONFLICT_DIR/10-resolve-check.txt" || true
+            fi
           fi
 
           if [ "$FINAL" = "ok" ]; then
@@ -524,7 +557,7 @@ jobs:
             echo "### :white_check_mark: Auto-resolve berhasil; merge dilanjutkan dan build diproses" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "resolve_status=failed" >> "$GITHUB_OUTPUT"
-            echo "::error::Auto-resolve gagal. $UNMERGED path unmerged, $MARKERS file masih punya marker."
+            echo "::error::Auto-resolve gagal. resolver_rc=$RESOLVER_RC, unmerged_before=$UNMERGED_BEFORE, unmerged_after_add=$UNMERGED_AFTER, files_with_markers=$MARKERS."
             echo "### :x: Auto-resolve gagal; build dibatalkan" >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -627,6 +660,15 @@ jobs:
             echo "--- ccache stats ---"
             ccache -s 2>/dev/null || true
           } > "$GITHUB_WORKSPACE/build-info.txt"
+
+      - name: Upload build log when build fails
+        if: failure() && (steps.apply.outputs.apply_status == 'ok' || steps.resolve.outputs.resolve_status == 'ok')
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-log
+          path: ${{ github.workspace }}/build.log
+          retention-days: 7
+          if-no-files-found: warn
 
       # ------------------------------------------------------------------
       # 5. Bungkus AnyKernel3

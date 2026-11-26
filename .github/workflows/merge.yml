@@ -1,426 +1,458 @@
-# Evernight Kernel — Workflow A: Merge & Source Validation
-# REMOTE-FIRST: all source acquisition, merge, conflict handling, and validation run
-# on GitHub-hosted runners. Local OpenCode never clones/builds/merges the kernel.
-# Target: Xiaomi Redmi 12C (earth), MT6768, ARM64, Android 16 / LineageOS 23.2.
-#
-# Verified read-only (not invented):
-#   base   : https://github.com/LineageOS/android_kernel_xiaomi_earth  branch lineage-23.2
-#   original: Linux 4.19.325-cip124-st8  (Makefile 4.19.325 + localversion-cip=-cip124 + localversion-st=-st8)
-#   CIP    : https://git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip.git  (official CIP source)
-#   target : cip137-st21 requested; upstream tag v4.19.325-cip137-st21 does NOT exist.
-#            verified compatible: v4.19-st21 (commit a6bb562ae602cbc05a5080e4bec0eaa601e3787f,
-#            Linux 4.19.325, localversion-st=-st21; tree matches v4.19.325-cip137
-#            commit 1bb512106982a56a0eb71afb604bb3afa03d1d46) + set localversion-cip=-cip137
-#            -> effective 4.19.325-cip137-st21. Nothing fabricated.
-name: kernel-merge
+name: Kernel CIP Merge / Upgrade (Manual - Redmi 12C / earth)
+
+# Manual-only. Tidak memerlukan PAT / token eksternal:
+# - clone repo publik memakai HTTPS anonim
+# - artifact diunggah lewat runtime token bawaan GitHub Actions
+# - permissions dibatasi hanya "contents: read"
 
 on:
   workflow_dispatch:
     inputs:
-      base_repo:
-        description: 'Base kernel repository URL'
-        required: false
-        default: 'https://github.com/LineageOS/android_kernel_xiaomi_earth'
-      base_branch:
-        description: 'Base branch'
-        required: false
+      source_repo:
+        description: 'Repository kernel sumber (URL HTTPS)'
+        required: true
+        type: string
+        default: 'https://github.com/LineageOS/android_kernel_xiaomi_earth.git'
+      source_branch:
+        description: 'Branch kernel sumber'
+        required: true
+        type: string
         default: 'lineage-23.2'
-      upstream_repo:
-        description: 'CIP upstream git URL (official, verified; not guessed)'
-        required: false
+      cip_remote:
+        description: 'Remote Linux CIP resmi (kernel.org; alternatif: https://gitlab.com/cip-project/cip-kernel/linux-cip.git)'
+        required: true
+        type: string
         default: 'https://git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip.git'
-      upstream_tag:
-        description: 'CIP upstream tag to integrate (verified compatible)'
+      cip_ref:
+        description: 'Target CIP: "latest" (tag stabil terbaru), nama tag, atau nama branch'
+        required: true
+        type: string
+        default: 'latest'
+      base_cip_tag:
+        description: 'Tag CIP terakhir yang sudah dikenal baik (hanya dipakai mode cherry-pick)'
         required: false
-        default: 'v4.19-st21'
-      upgrade_branch:
-        description: 'Dedicated upgrade branch'
-        required: false
-        default: 'kernel-upgrade/cip137-st21'
-      original_version:
-        description: 'Original kernel version string for baseline verification'
-        required: false
-        default: '4.19.325-cip124-st8'
-      original_cip:
-        description: 'Original CIP localversion'
-        required: false
-        default: '-cip124'
-      original_st:
-        description: 'Original ST localversion'
-        required: false
-        default: '-st8'
-      target_cip:
-        description: 'Target CIP localversion'
-        required: false
-        default: '-cip137'
-      target_st:
-        description: 'Target ST localversion'
-        required: false
-        default: '-st21'
-      target_kernel_version:
-        description: 'Expected upstream kernel version'
-        required: false
-        default: '4.19.325'
-      mode:
-        description: 'single = one merge of upstream tag; incremental = ordered intermediate ST tags'
-        required: false
-        default: 'single'
+        type: string
+        default: 'v4.19.325-cip124'
+      merge_mode:
+        description: 'Cara aplikasi update CIP. merge = default; cherry-pick = paling aman untuk vendor tree; rebase = eksperimen'
+        required: true
         type: choice
-        choices:
-          - single
-          - incremental
+        default: 'merge'
+        options:
+          - merge
+          - cherry-pick
+          - rebase
+      defconfig:
+        description: 'Defconfig kernel (arch/arm64/configs/<nama>)'
+        required: true
+        type: string
+        default: 'earth_defconfig'
+      arch:
+        description: 'Arsitektur kernel'
+        required: true
+        type: string
+        default: 'arm64'
+      compiler:
+        description: 'Toolchain yang dipakai'
+        required: true
+        type: choice
+        default: 'gcc'
+        options:
+          - gcc
+          - clang
+      cross_compile:
+        description: 'Prefix cross compiler 64-bit'
+        required: true
+        type: string
+        default: 'aarch64-linux-gnu-'
+      cross_compile_arm32:
+        description: 'Prefix cross compiler 32-bit (vdso / 32-bit compat)'
+        required: true
+        type: string
+        default: 'arm-linux-gnueabihf-'
+      toolchain_repo:
+        description: 'OPSIONAL: repo prebuilt toolchain (gcc/clang). Kosongkan untuk memakai cross toolchain Ubuntu'
+        required: false
+        type: string
+        default: ''
+      toolchain_branch:
+        description: 'Branch repo prebuilt toolchain di atas'
+        required: false
+        type: string
+        default: 'main'
+      jobs:
+        description: 'Jumlah paralel make (-j). Turunkan jika OOM'
+        required: true
+        type: string
+        default: '4'
+      anykernel3_repo:
+        description: 'Repo AnyKernel3'
+        required: true
+        type: string
+        default: 'https://github.com/osm0sis/AnyKernel3.git'
+      anykernel3_branch:
+        description: 'Branch AnyKernel3'
+        required: true
+        type: string
+        default: 'master'
+      device_codename:
+        description: 'Codename device untuk anykernel.sh'
+        required: true
+        type: string
+        default: 'earth'
 
-# Minimal permissions. No secrets are hardcoded. Auto-provided GITHUB_TOKEN used only server-side.
 permissions:
-  contents: write   # push upgrade branch; nothing else
+  contents: read
 
 concurrency:
-  group: kernel-merge-${{ inputs.upgrade_branch || 'kernel-upgrade/cip137-st21' }}
+  group: kernel-cip-${{ github.ref }}-${{ inputs.device_codename }}
   cancel-in-progress: false
 
-env:
-  MERGE_DIAG_DIR: ${{ github.workspace }}/merge-diagnostics
-  UPGRADE_BRANCH: ${{ inputs.upgrade_branch || 'kernel-upgrade/cip137-st21' }}
-
 jobs:
-  merge:
-    name: CIP verification + incremental merge + source validation
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    outputs:
-      upstream_commit: ${{ steps.verify_upstream.outputs.upstream_commit }}
-      original_commit: ${{ steps.baseline.outputs.original_commit }}
-      merge_base: ${{ steps.range.outputs.merge_base }}
-      integrated_commits: ${{ steps.range.outputs.integrated_commits }}
-      resolved_conflicts: ${{ steps.merge.outputs.resolved_conflicts }}
-      upgrade_branch: ${{ env.UPGRADE_BRANCH }}
-      effective_version: ${{ steps.finalize.outputs.effective_version }}
+  merge-upgrade:
+    name: Merge CIP -> Build -> Package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    env:
+      SOURCE_REPO: ${{ inputs.source_repo }}
+      SOURCE_BRANCH: ${{ inputs.source_branch }}
+      CIP_REMOTE: ${{ inputs.cip_remote }}
+      CIP_REF: ${{ inputs.cip_ref }}
+      BASE_CIP_TAG: ${{ inputs.base_cip_tag }}
+      MERGE_MODE: ${{ inputs.merge_mode }}
+      DEFCONFIG: ${{ inputs.defconfig }}
+      ARCH: ${{ inputs.arch }}
+      COMPILER: ${{ inputs.compiler }}
+      CROSS_COMPILE: ${{ inputs.cross_compile }}
+      CROSS_COMPILE_ARM32: ${{ inputs.cross_compile_arm32 }}
+      TOOLCHAIN_REPO: ${{ inputs.toolchain_repo }}
+      TOOLCHAIN_BRANCH: ${{ inputs.toolchain_branch }}
+      JOBS: ${{ inputs.jobs }}
+      AK3_REPO: ${{ inputs.anykernel3_repo }}
+      AK3_BRANCH: ${{ inputs.anykernel3_branch }}
+      DEVICE: ${{ inputs.device_codename }}
+      WORKDIR: ${{ github.workspace }}/kernel
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CONFLICT_DIR: ${{ github.workspace }}/conflict-logs
+
     steps:
-      - name: Resource snapshot (runner memory/disk)
-        run: |
-          echo "nproc=$(nproc)"; free -m; df -h / | tail -n 1
-          mkdir -p "$MERGE_DIAG_DIR"
-
-      - name: Install minimal tooling
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends git ca-certificates jq
-
-      # ---- Phase 1: source acquisition (shallow, single-branch, no extra tags/history) ----
-      - name: Clone base repository (shallow, single-branch)
+      # ------------------------------------------------------------------
+      # 0. Dependensi + ccache
+      # ------------------------------------------------------------------
+      - name: Install dependencies and ccache
         run: |
           set -euo pipefail
-          git clone --no-tags --single-branch --depth 1 \
-            --branch "${{ inputs.base_branch || 'lineage-23.2' }}" \
-            "${{ inputs.base_repo || 'https://github.com/LineageOS/android_kernel_xiaomi_earth' }}" \
-            "$GITHUB_WORKSPACE/src"
-          cd "$GITHUB_WORKSPACE/src"
-          git remote -v
-
-      # ---- Verify original CIP124-st8 baseline (record; warn, never fabricate) ----
-      - name: Verify original CIP124-st8 baseline
-        id: baseline
-        working-directory: ${{ github.workspace }}/src
-        run: |
-          set -euo pipefail
-          ORIG=$(git rev-parse HEAD)
-          echo "original_commit=$ORIG" >> "$GITHUB_OUTPUT"
-          echo "original_commit=$ORIG"
-          echo "== kernel version =="
-          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' Makefile
-          KVER=$(awk '/^VERSION =/{v=$3}/^PATCHLEVEL =/{p=$3}/^SUBLEVEL =/{s=$3}END{print v"."p"."s}' Makefile)
-          echo "kernel_version=$KVER"
-          echo "== localversion files =="
-          echo -n "localversion-cip: "; cat localversion-cip 2>/dev/null || echo "(absent)"
-          echo -n "localversion-st : "; cat localversion-st 2>/dev/null || echo "(absent)"
-          echo -n "CONFIG_LOCALVERSION: "; grep -E '^CONFIG_LOCALVERSION=' arch/arm64/configs/earth_defconfig 2>/dev/null || echo "(unset)"
-          CIP=$(tr -d '[:space:]' < localversion-cip 2>/dev/null || echo '')
-          ST=$(tr -d '[:space:]' < localversion-st 2>/dev/null || echo '')
-          EXPECTED="${{ inputs.original_version || '4.19.325-cip124-st8' }}"
-          {
-            echo "original_commit=$ORIG"
-            echo "kernel_version=$KVER"
-            echo "localversion_cip=$CIP"
-            echo "localversion_st=$ST"
-            echo "expected_original=$EXPECTED"
-          } > "$MERGE_DIAG_DIR/baseline.txt"
-          [ "$CIP" = "${{ inputs.original_cip || '-cip124' }}" ] || echo "::warning::localversion-cip '$CIP' != '${{ inputs.original_cip || '-cip124' }}'"
-          [ "$ST" = "${{ inputs.original_st || '-st8' }}" ] || echo "::warning::localversion-st '$ST' != '${{ inputs.original_st || '-st8' }}'"
-          test -f arch/arm64/configs/earth_defconfig || echo "::warning::earth_defconfig not found at expected path"
-
-      # ---- Phase 2: CIP upstream verification (remote metadata; nothing guessed) ----
-      - name: Verify CIP upstream remote and target revision
-        id: verify_upstream
-        working-directory: ${{ github.workspace }}/src
-        run: |
-          set -euo pipefail
-          UP="${{ inputs.upstream_repo || 'https://git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip.git' }}"
-          TAG="${{ inputs.upstream_tag || 'v4.19-st21' }}"
-          echo "upstream=$UP tag=$TAG"
-          REFS=$(git ls-remote --tags "$UP" "$TAG" "refs/tags/$TAG^{}")
-          echo "$REFS"
-          [ -n "$REFS" ] || { echo "::error::upstream tag $TAG not found in $UP"; echo "$TAG" > "$MERGE_DIAG_DIR/failed-commits.txt"; exit 1; }
-          COMMIT=$(printf '%s\n' "$REFS" | awk -v t="refs/tags/$TAG^{}" '$2==t{print $1}')
-          [ -n "$COMMIT" ] || COMMIT=$(printf '%s\n' "$REFS" | awk -v t="refs/tags/$TAG" '$2==t{print $1}')
-          [ -n "$COMMIT" ] || { echo "::error::could not resolve commit for $TAG"; exit 1; }
-          echo "upstream_commit=$COMMIT" >> "$GITHUB_OUTPUT"
-          echo "upstream_commit=$COMMIT"
-          {
-            echo "upstream_repo=$UP"
-            echo "upstream_tag=$TAG"
-            echo "upstream_commit=$COMMIT"
-          } > "$MERGE_DIAG_DIR/upstream.txt"
-          # fetch only necessary history for this tag; deepened later for merge-base
-          git remote add cip "$UP" 2>/dev/null || git remote set-url cip "$UP"
-          git fetch --no-tags --depth 1 cip "refs/tags/$TAG"
-          UPSTREAM_REF=$(git rev-parse FETCH_HEAD)
-          echo "fetched=$UPSTREAM_REF"
-          [ "$UPSTREAM_REF" = "$COMMIT" ] || { echo "::error::fetched $UPSTREAM_REF != resolved $COMMIT"; exit 1; }
-          KVER=$(git show "$UPSTREAM_REF:Makefile" | awk '/^VERSION =/{v=$3}/^PATCHLEVEL =/{p=$3}/^SUBLEVEL =/{s=$3}END{print v"."p"."s}')
-          echo "upstream_kernel_version=$KVER"
-          echo "upstream_kernel_version=$KVER" >> "$MERGE_DIAG_DIR/upstream.txt"
-          EXPKV="${{ inputs.target_kernel_version || '4.19.325' }}"
-          [ "$KVER" = "$EXPKV" ] || { echo "::error::upstream kernel $KVER != expected $EXPKV"; exit 1; }
-          echo -n "upstream localversion-st: "; git show "$UPSTREAM_REF:localversion-st" 2>/dev/null || echo "(absent)"
-          echo -n "upstream localversion-cip: "; git show "$UPSTREAM_REF:localversion-cip" 2>/dev/null || echo "(absent)"
-
-      # ---- Determine actual commit range; merge-base via incremental deepening ----
-      - name: Determine commit range and merge-base
-        id: range
-        working-directory: ${{ github.workspace }}/src
-        run: |
-          set -euo pipefail
-          TAG="${{ inputs.upstream_tag || 'v4.19-st21' }}"
-          BASE_BRANCH="${{ inputs.base_branch || 'lineage-23.2' }}"
-          UP=$(git rev-parse FETCH_HEAD)
-          MB=""
-          for depth in 50 200 800 3200; do
-            git fetch --no-tags --depth=$depth origin "$BASE_BRANCH" 2>/dev/null || true
-            git fetch --no-tags --depth=$depth cip "refs/tags/$TAG" 2>/dev/null || true
-            MB=$(git merge-base HEAD FETCH_HEAD 2>/dev/null || echo "")
-            [ -n "$MB" ] && break
-          done
-          if [ -z "$MB" ]; then
-            git fetch --unshallow origin "$BASE_BRANCH" 2>/dev/null || git fetch origin "$BASE_BRANCH"
-            git fetch --unshallow cip "refs/tags/$TAG" 2>/dev/null || git fetch cip "refs/tags/$TAG"
-            MB=$(git merge-base HEAD FETCH_HEAD 2>/dev/null || echo "")
-          fi
-          echo "merge_base=${MB:-unknown}" >> "$GITHUB_OUTPUT"
-          UP=$(git rev-parse FETCH_HEAD)
-          if [ -n "$MB" ]; then COUNT=$(git rev-list --count "$MB..$UP" 2>/dev/null || echo 0); else COUNT=$(git rev-list --count "$UP" 2>/dev/null || echo 0); fi
-          echo "integrated_commits=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "merge_base=${MB:-unknown}"; echo "integrated_commits=$COUNT"
-          {
-            echo "merge_base=${MB:-unknown}"
-            echo "range=${MB:-<root>}..$UP"
-            echo "integrated_commits=$COUNT"
-            echo "note=No upstream commits silently skipped; verified tag commit=$UP"
-          } > "$MERGE_DIAG_DIR/commit-range.txt"
-
-      # ---- Prepare dedicated upgrade branch ----
-      - name: Create upgrade branch
-        working-directory: ${{ github.workspace }}/src
-        run: |
-          set -euo pipefail
-          git checkout -B "$UPGRADE_BRANCH"
-          git config user.name "evernight-kernel-ci"
-          git config user.email "ci@evernight.invalid"
-
-      # ---- Incremental merge engine (never -X ours/-X theirs; no blind deletion; stop on uncertain conflicts) ----
-      - name: Merge upstream CIP (careful; no silent skips)
-        id: merge
-        working-directory: ${{ github.workspace }}/src
-        run: |
-          set +e
-          TAG="${{ inputs.upstream_tag || 'v4.19-st21' }}"
-          MODE="${{ inputs.mode || 'single' }}"
-          RESOLVED=0
-          : > "$MERGE_DIAG_DIR/merge-conflicts.txt"
-          : > "$MERGE_DIAG_DIR/unresolved-files.txt"
-          : > "$MERGE_DIAG_DIR/failed-commits.txt"
-          : > "$MERGE_DIAG_DIR/merge-errors.log"
-
-          do_merge() {
-            local ref="$1" label="$2"
-            echo "::group::merge $label ($ref)"
-            git merge --no-ff --no-commit --no-edit "$ref" >> "$MERGE_DIAG_DIR/merge-errors.log" 2>&1
-            local rc=$?
-            if [ $rc -ne 0 ]; then
-              echo "merge conflict/failure for $label ($ref) rc=$rc" | tee -a "$MERGE_DIAG_DIR/merge-errors.log"
-              echo "$label $ref" >> "$MERGE_DIAG_DIR/failed-commits.txt"
-              git diff --name-only --diff-filter=U >> "$MERGE_DIAG_DIR/merge-conflicts.txt"
-              git status --porcelain | awk '$1 ~ /^(UU|AA|DD|AU|UA|DU|UD)$/ {print $2}' >> "$MERGE_DIAG_DIR/merge-conflicts.txt"
-              sort -u -o "$MERGE_DIAG_DIR/merge-conflicts.txt" "$MERGE_DIAG_DIR/merge-conflicts.txt"
-              cp "$MERGE_DIAG_DIR/merge-conflicts.txt" "$MERGE_DIAG_DIR/unresolved-files.txt"
-              echo "::endgroup::"
-              return $rc
-            fi
-            echo "::endgroup::"
-            return 0
-          }
-
-          if [ "$MODE" = "incremental" ]; then
-            for n in $(seq 9 21); do
-              T="v4.19-st$n"
-              if git ls-remote --tags cip "$T" | grep -q .; then
-                git fetch --no-tags --depth 1 cip "refs/tags/$T" 2>/dev/null || true
-                do_merge FETCH_HEAD "$T"
-                [ -s "$MERGE_DIAG_DIR/unresolved-files.txt" ] && break
-              fi
-            done
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git ca-certificates curl bc bison flex zip unzip xz-utils \
+            build-essential libssl-dev libncurses-dev ccache
+          if [ "$COMPILER" = "clang" ]; then
+            sudo apt-get install -y --no-install-recommends clang lld llvm
           else
-            git fetch --no-tags --depth 1 cip "refs/tags/$TAG" 2>/dev/null || true
-            do_merge FETCH_HEAD "$TAG"
+            sudo apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+              gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+          fi
+          ccache --version
+          ccache -M 5G
+          mkdir -p "$CCACHE_DIR"
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ env.ARCH }}-${{ env.DEFCONFIG }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ env.ARCH }}-${{ env.DEFCONFIG }}-
+            ccache-${{ runner.os }}-${{ env.ARCH }}-
+
+      # ------------------------------------------------------------------
+      # 1. Resolve target CIP (latest = tag stabil 4.19 non-RT terakhir)
+      # ------------------------------------------------------------------
+      - name: Resolve CIP target
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "$CIP_REF" = "latest" ]; then
+            CIP_TAG="$(git ls-remote --tags --refs "$CIP_REMOTE" 'v4.19.*-cip*' \
+              | awk '{print $2}' \
+              | sed 's#^refs/tags/##' \
+              | grep -v -- '-rt' \
+              | grep -v -- '-rebase' \
+              | sort -V \
+              | tail -n 1)"
+          else
+            CIP_TAG="$CIP_REF"
           fi
 
-          # ---- Careful conflict resolution: ONLY explicitly whitelisted, demonstrably compatible cases ----
-          if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-            git diff --name-only --diff-filter=U > "$MERGE_DIAG_DIR/merge-conflicts.txt" 2>/dev/null
-            git status --porcelain | awk '$1 ~ /^(UU|AA|DD|AU|UA|DU|UD)$/ {print $2}' >> "$MERGE_DIAG_DIR/merge-conflicts.txt"
-            sort -u -o "$MERGE_DIAG_DIR/merge-conflicts.txt" "$MERGE_DIAG_DIR/merge-conflicts.txt"
-
-            SAFE=0
-            # localversion-st: version bump only (no code/hardware); upstream owns it; set target
-            if grep -qx 'localversion-st' "$MERGE_DIAG_DIR/merge-conflicts.txt"; then
-              printf '%s\n' "${{ inputs.target_st || '-st21' }}" > localversion-st
-              git add localversion-st
-              echo "RESOLVED localversion-st -> ${{ inputs.target_st || '-st21' }} (version bump; no code)" >> "$MERGE_DIAG_DIR/merge-conflicts.txt"
-              SAFE=$((SAFE+1))
-            fi
-            # localversion-cip: version bump only; set target
-            if grep -qx 'localversion-cip' "$MERGE_DIAG_DIR/merge-conflicts.txt"; then
-              printf '%s\n' "${{ inputs.target_cip || '-cip137' }}" > localversion-cip
-              git add localversion-cip
-              echo "RESOLVED localversion-cip -> ${{ inputs.target_cip || '-cip137' }} (version bump; no code)" >> "$MERGE_DIAG_DIR/merge-conflicts.txt"
-              SAFE=$((SAFE+1))
-            fi
-            RESOLVED=$SAFE
-
-            git diff --name-only --diff-filter=U > "$MERGE_DIAG_DIR/unresolved-files.txt" 2>/dev/null
-            if [ -s "$MERGE_DIAG_DIR/unresolved-files.txt" ]; then
-              echo "::error::unresolved conflicts remain; stopping (no silent resolution; no hardware guesses)"
-              cp "$MERGE_DIAG_DIR/unresolved-files.txt" "$MERGE_DIAG_DIR/failed-commits.txt"
-            fi
-          fi
-
-          echo "resolved_conflicts=$RESOLVED" >> "$GITHUB_OUTPUT"
-
-          if git grep -nE '^(<<<<<<<|=======|>>>>>>>)' -- . >> "$MERGE_DIAG_DIR/merge-errors.log" 2>/dev/null; then
-            echo "::error::conflict markers found in tree"; echo conflict-markers >> "$MERGE_DIAG_DIR/unresolved-files.txt"
-          fi
-
-          if [ -s "$MERGE_DIAG_DIR/unresolved-files.txt" ]; then
-            git merge --abort 2>/dev/null || true
+          if [ -z "$CIP_TAG" ]; then
+            echo "::error::Tidak bisa menentukan tag CIP terbaru dari $CIP_REMOTE"
             exit 1
           fi
 
-          if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-            git commit -m "Merge CIP $TAG into $UPGRADE_BRANCH (Evernight Kernel cip137-st21); upstream verified tag $TAG; no -X ours/-X theirs; device-specific changes preserved; conflicts resolved carefully (merge-conflicts.txt); no upstream commits silently skipped." \
-              >> "$MERGE_DIAG_DIR/merge-errors.log" 2>&1 || { echo "::error::commit failed"; exit 1; }
+          if git ls-remote --exit-code --tags "$CIP_REMOTE" "refs/tags/$CIP_TAG" >/dev/null 2>&1; then
+            CIP_OBJ="refs/tags/$CIP_TAG"
+          elif git ls-remote --exit-code --heads "$CIP_REMOTE" "refs/heads/$CIP_TAG" >/dev/null 2>&1; then
+            CIP_OBJ="refs/heads/$CIP_TAG"
+          else
+            echo "::error::Ref '$CIP_TAG' tidak ditemukan (tag maupun branch) di $CIP_REMOTE"
+            exit 1
           fi
-          exit 0
 
-      # ---- Set effective CIP/ST version after merge ----
-      - name: Finalize effective version (4.19.325-cip137-st21)
-        id: finalize
-        working-directory: ${{ github.workspace }}/src
-        if: success()
+          echo "cip_tag=$CIP_TAG" >> "$GITHUB_OUTPUT"
+          echo "cip_obj=$CIP_OBJ" >> "$GITHUB_OUTPUT"
+          echo "version=${CIP_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "### Target CIP: \`$CIP_TAG\` (\`${CIP_TAG#v}\`) via \`$CIP_OBJ\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 2. Clone source + daftarkan remote CIP resmi
+      # ------------------------------------------------------------------
+      - name: Clone kernel source and add CIP remote
+        id: clone
         run: |
           set -euo pipefail
-          printf '%s\n' "${{ inputs.target_cip || '-cip137' }}" > localversion-cip
-          printf '%s\n' "${{ inputs.target_st || '-st21' }}" > localversion-st
-          git add localversion-cip localversion-st
-          if ! git diff --cached --quiet; then
-            git commit -m "Set CIP ${{ inputs.target_cip || '-cip137' }} / ST ${{ inputs.target_st || '-st21' }} -> effective 4.19.325-cip137-st21" || true
-          fi
-          KVER=$(awk '/^VERSION =/{v=$3}/^PATCHLEVEL =/{p=$3}/^SUBLEVEL =/{s=$3}END{print v"."p"."s}' Makefile)
-          CIP=$(tr -d '[:space:]' < localversion-cip); ST=$(tr -d '[:space:]' < localversion-st)
-          EFF="$KVER${CIP}${ST}"
-          echo "effective_version=$EFF" | tee "$MERGE_DIAG_DIR/effective-version.txt"
-          echo "effective_version=$EFF" >> "$GITHUB_OUTPUT"
+          git clone --single-branch --branch "$SOURCE_BRANCH" "$SOURCE_REPO" "$WORKDIR"
+          cd "$WORKDIR"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add cip "$CIP_REMOTE"
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Source: $SOURCE_REPO @ $SOURCE_BRANCH ($(git rev-parse --short HEAD))"
 
-      # ---- Source validation (static checks; no full build in Workflow A) ----
-      - name: Source validation
-        working-directory: ${{ github.workspace }}/src
-        if: success()
+      - name: Fetch CIP commit
         run: |
           set -euo pipefail
-          git fsck --no-dangling || true
-          if git grep -nE '^(<<<<<<<|=======|>>>>>>>)' -- . ; then echo "::error::conflict markers"; exit 1; else echo "no conflict markers"; fi
-          git diff --check HEAD~1..HEAD || { echo "::error::diff check failed"; exit 1; }
-          test -z "$(git diff --name-only --diff-filter=U)" || { echo "::error::unmerged paths"; exit 1; }
-          CHANGED=$(git diff --name-only HEAD~1..HEAD -- '*.c' '*.h' 2>/dev/null | head -n 50 || true)
-          if [ -n "$CHANGED" ] && [ -x scripts/checkpatch.pl ]; then
-            git diff HEAD~1..HEAD -- $CHANGED > "$GITHUB_WORKSPACE/changed.diff" 2>/dev/null || git diff HEAD~1..HEAD > "$GITHUB_WORKSPACE/changed.diff"
-            perl scripts/checkpatch.pl --no-signoff --no-summary --terse "$GITHUB_WORKSPACE/changed.diff" || echo "checkpatch reported issues (non-fatal)"
+          cd "$WORKDIR"
+          git fetch --no-tags cip "+${{ steps.meta.outputs.cip_obj }}:refs/remotes/cip/cip-target"
+          echo "CIP commit: $(git rev-parse refs/remotes/cip/cip-target)"
+          if [ "$MERGE_MODE" = "cherry-pick" ]; then
+            git fetch --no-tags cip "+refs/tags/$BASE_CIP_TAG:refs/tags/$BASE_CIP_TAG"
           fi
-          grep -q '^CONFIG_ARM64=y' arch/arm64/configs/earth_defconfig && echo "CONFIG_ARM64 present"
-          test -f arch/arm64/configs/earth_defconfig && echo "earth_defconfig preserved"
-          echo "source validation OK"
 
-      # ---- Push resulting upgrade branch (only on success) ----
-      - name: Push upgrade branch
-        working-directory: ${{ github.workspace }}/src
-        if: success()
+      # ------------------------------------------------------------------
+      # 3. Merge / cherry-pick / rebase + tangkap konflik
+      # ------------------------------------------------------------------
+      - name: Apply CIP upgrade
+        id: apply
         run: |
-          set -euo pipefail
-          git push --force-with-lease origin "$UPGRADE_BRANCH"
-          echo "pushed=$UPGRADE_BRANCH"
+          set -uo pipefail
+          cd "$WORKDIR"
+          mkdir -p "$CONFLICT_DIR"
+          CIP_TARGET="refs/remotes/cip/cip-target"
 
-      # ---- Source integrity report + compact merge summary ----
-      - name: Generate source integrity + merge report
-        if: always()
-        run: |
-          set +e
-          cd "$GITHUB_WORKSPACE/src" 2>/dev/null
-          {
-            echo "Evernight Kernel — source integrity report"
-            echo "generated=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "base_branch=${{ inputs.base_branch || 'lineage-23.2' }}"
-            echo "upgrade_branch=$UPGRADE_BRANCH"
-            echo "git_commit=$(git rev-parse HEAD 2>/dev/null || echo n/a)"
-            echo "git_tree=$(git rev-parse 'HEAD^{tree}' 2>/dev/null || echo n/a)"
-            echo "tracked_files_sha256_manifest="
-            git ls-files -z 2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null | sha256sum
-          } > "$MERGE_DIAG_DIR/source-integrity.txt"
-          {
-            echo "Evernight Kernel — merge summary"
-            echo "run=${{ github.run_id }}"
-            echo "original=${{ inputs.original_version || '4.19.325-cip124-st8' }}"
-            echo "target_tag=${{ inputs.upstream_tag || 'v4.19-st21' }}"
-            echo "target_effective=4.19.325${{ inputs.target_cip || '-cip137' }}${{ inputs.target_st || '-st21' }}"
-            echo "--- baseline ---";          cat "$MERGE_DIAG_DIR/baseline.txt" 2>/dev/null
-            echo "--- upstream ---";         cat "$MERGE_DIAG_DIR/upstream.txt" 2>/dev/null
-            echo "--- commit-range ---";     cat "$MERGE_DIAG_DIR/commit-range.txt" 2>/dev/null
-            echo "--- effective-version ---";cat "$MERGE_DIAG_DIR/effective-version.txt" 2>/dev/null
-            echo "--- merge-conflicts ---";  cat "$MERGE_DIAG_DIR/merge-conflicts.txt" 2>/dev/null
-            echo "--- unresolved-files ---"; cat "$MERGE_DIAG_DIR/unresolved-files.txt" 2>/dev/null
-            echo "--- failed-commits ---";   cat "$MERGE_DIAG_DIR/failed-commits.txt" 2>/dev/null
-          } > "$MERGE_DIAG_DIR/merge-summary.txt"
-          for f in merge-summary.txt merge-errors.log merge-conflicts.txt failed-commits.txt unresolved-files.txt source-integrity.txt; do
-            [ -f "$MERGE_DIAG_DIR/$f" ] || : > "$MERGE_DIAG_DIR/$f"
-          done
-          ls -la "$MERGE_DIAG_DIR"
+          capture_conflict() {
+            local reason="$1"
+            {
+              echo "CIP upgrade FAILED"
+              echo "Reason        : $reason"
+              echo "Source        : $SOURCE_REPO @ $SOURCE_BRANCH"
+              echo "Source HEAD   : ${{ steps.clone.outputs.source_sha }}"
+              echo "CIP target    : ${{ steps.meta.outputs.cip_tag }} ($(git rev-parse "$CIP_TARGET"))"
+              echo "Mode          : $MERGE_MODE"
+              echo "Runner        : $RUNNER_OS / $RUNNER_ARCH"
+              echo ""
+              echo "Build sengaja DIBATALKAN. Selesaikan konflik dulu, lalu jalankan ulang workflow."
+            } > "$CONFLICT_DIR/00-summary.txt"
 
-      # ---- Diagnostics upload ALWAYS; never overrides job status ----
-      - name: Upload merge diagnostics (always; does not override job status)
-        if: always()
+            git status --short 2>/dev/null | head -n 300 > "$CONFLICT_DIR/01-git-status.txt" || true
+            git diff --name-only --diff-filter=U 2>/dev/null | head -n 300 > "$CONFLICT_DIR/02-unmerged-paths.txt" || true
+            git diff --no-ext-diff 2>/dev/null | head -n 5000 > "$CONFLICT_DIR/03-conflict-diff.patch" || true
+            git ls-files -u 2>/dev/null | head -n 500 > "$CONFLICT_DIR/04-unmerged-index.txt" || true
+            git log --oneline --decorate -20 2>/dev/null > "$CONFLICT_DIR/05-recent-log.txt" || true
+            (git merge-base HEAD "$CIP_TARGET" 2>/dev/null || echo "NO_COMMON_ANCESTOR") \
+              > "$CONFLICT_DIR/06-merge-base.txt" || true
+
+            echo "apply_status=failed" >> "$GITHUB_OUTPUT"
+            echo "### :x: Konflik saat menerapkan \`${{ steps.meta.outputs.cip_tag }}\` (\`$reason\`)" >> "$GITHUB_STEP_SUMMARY"
+            echo "Unduh artifact **cip-conflict-logs** untuk detail (`00-summary.txt`, `01-git-status.txt`, `02-unmerged-paths.txt`, `03-conflict-diff.patch`)." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          if [ "$MERGE_MODE" = "merge" ]; then
+            EXTRA=""
+            if ! git merge-base HEAD "$CIP_TARGET" >/dev/null 2>&1; then
+              EXTRA="--allow-unrelated-histories"
+              echo "::warning::Tidak ada common ancestor dengan CIP. Memakai --allow-unrelated-histories."
+            fi
+            # shellcheck disable=SC2086
+            if ! git merge --no-ff --no-edit $EXTRA \
+                 -m "Merge ${{ steps.meta.outputs.cip_tag }} into $SOURCE_BRANCH (manual CIP upgrade)" \
+                 "$CIP_TARGET"; then
+              capture_conflict "git merge gagal"
+            fi
+
+          elif [ "$MERGE_MODE" = "rebase" ]; then
+            if git merge-base HEAD "$CIP_TARGET" >/dev/null 2>&1; then
+              if ! git rebase "$CIP_TARGET"; then
+                capture_conflict "git rebase gagal"
+              fi
+            else
+              echo "::warning::Rebase dari history yang tidak berkaitan; memakai --root."
+              if ! git rebase --onto "$CIP_TARGET" --root; then
+                capture_conflict "git rebase --onto --root gagal"
+              fi
+            fi
+
+          else # cherry-pick
+            if [ -z "$BASE_CIP_TAG" ]; then
+              capture_conflict "base_cip_tag kosong pada mode cherry-pick"
+            fi
+            if ! git rev-parse -q --verify "refs/tags/$BASE_CIP_TAG" >/dev/null; then
+              capture_conflict "tag baseline $BASE_CIP_TAG tidak tersedia"
+            fi
+            COMMITS="$(git rev-list --reverse "$BASE_CIP_TAG..$CIP_TARGET")"
+            echo "Cherry-pick $(echo "$COMMITS" | grep -c . || true) commit(s) $BASE_CIP_TAG..${{ steps.meta.outputs.cip_tag }}"
+            for c in $COMMITS; do
+              nparents="$(git rev-list --parents -n 1 "$c" | wc -w)"
+              if [ "$nparents" -gt 2 ]; then
+                if ! git cherry-pick -m 1 "$c"; then
+                  capture_conflict "cherry-pick merge commit $c gagal"
+                fi
+              else
+                if ! git cherry-pick "$c"; then
+                  capture_conflict "cherry-pick $c gagal"
+                fi
+              fi
+            done
+          fi
+
+          echo "apply_status=ok" >> "$GITHUB_OUTPUT"
+          git diff --binary "origin/$SOURCE_BRANCH..HEAD" > "$GITHUB_WORKSPACE/cip-upgrade.patch" || true
+          echo "### :white_check_mark: CIP \`${{ steps.meta.outputs.cip_tag }}\` berhasil diterapkan (mode: \`$MERGE_MODE\`)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload conflict diagnostics
+        if: failure() && steps.apply.outputs.apply_status == 'failed'
         uses: actions/upload-artifact@v4
         with:
-          name: merge-diagnostics
-          path: ${{ github.workspace }}/merge-diagnostics/
-          if-no-files-found: ignore
-          retention-days: 14
+          name: cip-conflict-logs
+          path: ${{ env.CONFLICT_DIR }}
+          retention-days: 7
+          compression-level: 9
+          if-no-files-found: warn
 
-  # ---- Workflow chaining: build ONLY after successful merge ----
-  build:
-    name: Trigger kernel build
-    needs: merge
-    if: ${{ success() }}
-    uses: ./.github/workflows/kernel-build.yml
-    with:
-      ref: ${{ needs.merge.outputs.upgrade_branch }}
-      defconfig: earth_defconfig
-      build_target: Image
-      jobs: 4
-    secrets: inherit
+      # ------------------------------------------------------------------
+      # 4. Setup toolchain + ccache masquerade, lalu build
+      # ------------------------------------------------------------------
+      - name: Build kernel with ccache
+        if: success()
+        env:
+          SOURCE_SHA: ${{ steps.clone.outputs.source_sha }}
+          CIP_TAG: ${{ steps.meta.outputs.cip_tag }}
+          CIP_OBJ: ${{ steps.meta.outputs.cip_obj }}
+        run: |
+          set -euo pipefail
+
+          TOOLBIN=""
+          if [ -n "$TOOLCHAIN_REPO" ]; then
+            if ! git clone --depth 1 --branch "$TOOLCHAIN_BRANCH" \
+                 "$TOOLCHAIN_REPO" "$GITHUB_WORKSPACE/toolchain" 2>/dev/null; then
+              git clone --depth 1 "$TOOLCHAIN_REPO" "$GITHUB_WORKSPACE/toolchain"
+            fi
+            TOOLBIN="$GITHUB_WORKSPACE/toolchain/bin"
+          fi
+
+          # ccache masquerade: symlink dengan nama tool persis yang dipanggil kernel
+          mkdir -p "$CCACHE_DIR/bin"
+          CCACHE_BIN="$(command -v ccache)"
+          for prefix in "$CROSS_COMPILE" "$CROSS_COMPILE_ARM32"; do
+            [ -n "$prefix" ] || continue
+            for suffix in gcc g++ cc c++; do
+              ln -sf "$CCACHE_BIN" "$CCACHE_DIR/bin/${prefix}${suffix}"
+            done
+          done
+          if [ "$COMPILER" = "clang" ]; then
+            ln -sf "$CCACHE_BIN" "$CCACHE_DIR/bin/clang"
+            ln -sf "$CCACHE_BIN" "$CCACHE_DIR/bin/clang++"
+          fi
+          export PATH="$CCACHE_DIR/bin:$TOOLBIN:$PATH"
+
+          cd "$WORKDIR"
+          echo "Compiler : $COMPILER"
+          echo "CIP      : $CIP_TAG ($(git rev-parse "$CIP_OBJ" 2>/dev/null || echo n/a))"
+          echo "ccache   : $(ccache --version | head -n 1)"
+
+          make O=out ARCH="$ARCH" "$DEFCONFIG"
+
+          if [ "$COMPILER" = "clang" ]; then
+            make "-j$JOBS" O=out ARCH="$ARCH" \
+              CC=clang LD=ld.lld \
+              CROSS_COMPILE="$CROSS_COMPILE" \
+              CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
+              2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          else
+            make "-j$JOBS" O=out ARCH="$ARCH" \
+              CROSS_COMPILE="$CROSS_COMPILE" \
+              CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
+              2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          fi
+
+          BOOTDIR="out/arch/$ARCH/boot"
+          IMAGE=""
+          for candidate in Image.gz-dtb Image.gz Image; do
+            if [ -f "$BOOTDIR/$candidate" ]; then IMAGE="$candidate"; break; fi
+          done
+          if [ -z "$IMAGE" ]; then
+            echo "::error::Tidak ada Image/Image.gz/Image.gz-dtb yang dihasilkan"
+            exit 1
+          fi
+          echo "$IMAGE" > "$GITHUB_WORKSPACE/image-name.txt"
+
+          {
+            echo "Kernel source    : $SOURCE_REPO"
+            echo "Source branch    : $SOURCE_BRANCH"
+            echo "Source HEAD      : $SOURCE_SHA"
+            echo "CIP target       : $CIP_TAG"
+            echo "Apply mode       : $MERGE_MODE"
+            echo "Defconfig        : $DEFCONFIG"
+            echo "Compiler         : $COMPILER"
+            echo "-j               : $JOBS"
+            echo "Kernel image     : $IMAGE"
+            echo "Kernel release   : $(grep -h UTS_RELEASE out/include/generated/utsrelease.h 2>/dev/null | head -n 1 || echo n/a)"
+            echo "Merged HEAD      : $(git rev-parse HEAD)"
+            echo ""
+            echo "--- ccache stats ---"
+            ccache -s 2>/dev/null || true
+          } > "$GITHUB_WORKSPACE/build-info.txt"
+
+      # ------------------------------------------------------------------
+      # 5. Bungkus AnyKernel3
+      # ------------------------------------------------------------------
+      - name: Package AnyKernel3 flashable zip
+        id: package
+        if: success()
+        run: |
+          set -euo pipefail
+          IMAGE="$(cat "$GITHUB_WORKSPACE/image-name.txt")"
+          git clone --depth 1 --branch "$AK3_BRANCH" "$AK3_REPO" "$GITHUB_WORKSPACE/anykernel"
+          cd "$GITHUB_WORKSPACE/anykernel"
+
+          sed -i "s#^kernel.string=.*#kernel.string=LineageOS CIP ${{ steps.meta.outputs.version }} (earth) by GitHub Actions#" anykernel.sh
+          sed -i "s#^do.devicecheck=.*#do.devicecheck=1#" anykernel.sh
+          sed -i "s#^device.name1=.*#device.name1=$DEVICE#" anykernel.sh
+          for i in 2 3 4 5; do sed -i "s#^device.name$i=.*#device.name$i=#" anykernel.sh; done
+          sed -i "s#^supported.versions=.*#supported.versions=#" anykernel.sh
+          sed -i "s#^supported.patchlevels=.*#supported.patchlevels=#" anykernel.sh
+          sed -i "s#^supported.vendorpatchlevels=.*#supported.vendorpatchlevels=#" anykernel.sh
+          sed -i "s#^BLOCK=.*#BLOCK=/dev/block/bootdevice/by-name/boot#" anykernel.sh
+          sed -i "s#^IS_SLOT_DEVICE=.*#IS_SLOT_DEVICE=auto#" anykernel.sh
+
+          cp "$WORKDIR/out/arch/$ARCH/boot/$IMAGE" .
+          ZIP="$GITHUB_WORKSPACE/kernel-${DEVICE}-${{ steps.meta.outputs.version }}-$(date +%Y%m%d).zip"
+          zip -r9 "$ZIP" * -x .git README.md '*placeholder*'
+
+          echo "zip_path=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "### :package: Flashable zip: \`$(basename "$ZIP")\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload flashable zip, patch, and build info
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ inputs.device_codename }}-${{ steps.meta.outputs.version }}
+          path: |
+            ${{ steps.package.outputs.zip_path }}
+            ${{ github.workspace }}/cip-upgrade.patch
+            ${{ github.workspace }}/build-info.txt
+          retention-days: 14
+          compression-level: 9
+          if-no-files-found: warn

@@ -1,20 +1,20 @@
-name: Merge CIP into lineage-23.2
+name: Merge CIP into lineage-23.2 (patch + artifact)
 
 on:
   workflow_dispatch:
     inputs:
-      source-branch:
-        description: 'Branch to merge into'
+      source-repo:
+        description: 'Vendor kernel source repository'
         required: true
-        default: 'lineage-23.2'
+        default: 'https://github.com/LineageOS/android_kernel_xiaomi_earth.git'
         type: string
-      target-branch:
-        description: 'Branch to create/push with the merge result'
+      source-ref:
+        description: 'Vendor source commit (pinned to the analysed tree)'
         required: true
-        default: 'cip/4.19.325-cip137-merge'
+        default: 'd7851c271883170591db1ef71e1eff17b6ddacdb'
         type: string
       cip-base-tag:
-        description: 'CIP tag matching the current localversion files'
+        description: 'CIP tag matching the vendor localversion files'
         required: true
         default: 'v4.19.325-cip124'
         type: string
@@ -23,48 +23,72 @@ on:
         required: true
         default: 'v4.19.325-cip137'
         type: string
-      open-pr:
-        description: 'Open a pull request for the merge branch'
-        required: false
-        default: true
-        type: boolean
       dry-run:
-        description: 'Resolve and verify locally, but do not push or open a PR'
+        description: 'Only resolve and verify; do not create patch, artifact or release'
         required: false
         default: false
         type: boolean
+      create-release:
+        description: 'Attach the patch and source tarball to a GitHub Release'
+        required: false
+        default: true
+        type: boolean
+      release-tag-prefix:
+        description: 'Prefix for the generated release tag'
+        required: false
+        default: 'v4.19.325-perf-cip137-st21'
+        type: string
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   merge:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout kernel branch
+      - name: Checkout this repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source-branch }}
           fetch-depth: 1
           token: ${{ secrets.CIP_MERGE_TOKEN || github.token }}
 
+      - name: Clone vendor kernel source
+        env:
+          SOURCE_REPO: ${{ inputs.source-repo }}
+          SOURCE_REF: ${{ inputs.source-ref }}
+        run: |
+          set -euo pipefail
+          rm -rf kernel
+          mkdir kernel
+          cd kernel
+          git init -q
+          git remote add origin "$SOURCE_REPO"
+          if ! git fetch --depth=1 origin "$SOURCE_REF"; then
+            echo "::error::Cannot fetch $SOURCE_REF from $SOURCE_REPO" >&2
+            exit 1
+          fi
+          git checkout -q FETCH_HEAD
+          git config user.email "cip-merge@users.noreply.github.com"
+          git config user.name "CIP Merge Bot"
+          echo "source sha: $(git rev-parse HEAD)"
+
       - name: Fetch CIP base and target tags
+        working-directory: kernel
         run: |
           set -euo pipefail
           git fetch --depth=1 https://gitlab.com/cip-project/cip-kernel/linux-cip.git \
             "refs/tags/${{ inputs.cip-base-tag }}:refs/tags/${{ inputs.cip-base-tag }}" \
             "refs/tags/${{ inputs.cip-target-tag }}:refs/tags/${{ inputs.cip-target-tag }}"
 
-      - name: Merge, resolve all conflicts, commit and push
+      - name: Merge, resolve conflicts and build patch
+        id: merge
+        working-directory: kernel
         env:
-          SOURCE_BRANCH: ${{ inputs.source-branch }}
-          TARGET_BRANCH: ${{ inputs.target-branch }}
+          SOURCE_REPO: ${{ inputs.source-repo }}
+          SOURCE_REF: ${{ inputs.source-ref }}
           CIP_BASE_TAG: ${{ inputs.cip-base-tag }}
           CIP_TARGET_TAG: ${{ inputs.cip-target-tag }}
-          OPEN_PR: ${{ inputs.open-pr }}
           DRY_RUN: ${{ inputs.dry-run }}
-          GH_TOKEN: ${{ secrets.CIP_MERGE_TOKEN || github.token }}
         run: |
           set -euo pipefail
 
@@ -100,7 +124,7 @@ jobs:
           log "computing synthetic 3-way merge"
           BASE_SYN="$(printf 'CIP base %s\n' "$CIP_BASE_TAG" \
             | git commit-tree "$(git rev-parse "$CIP_BASE_TAG^{tree}")")"
-          OURS_SYN="$(printf 'vendor %s\n' "$SOURCE_BRANCH" \
+          OURS_SYN="$(printf 'vendor %s\n' "$SOURCE_REF" \
             | git commit-tree "$(git rev-parse "$OURS^{tree}")")"
           THEIRS_SYN="$(printf 'CIP target %s\n' "$CIP_TARGET_TAG" \
             | git commit-tree "$(git rev-parse "$CIP_TARGET^{tree}")")"
@@ -144,7 +168,7 @@ jobs:
           sort -u "$TMP/expected.txt" > "$TMP/expected.sorted.txt"
           if ! diff -u "$TMP/expected.sorted.txt" "$TMP/actual.txt" > "$TMP/conflict.diff"; then
             cat "$TMP/conflict.diff" >&2
-            fail "unexpected conflict set; do not reuse these resolutions for this tag"
+            fail "unexpected conflict set; these inline resolutions match cip124 -> cip137 only"
           fi
           log "all $(wc -l < "$TMP/actual.txt") conflicts are covered by inline resolutions"
 
@@ -443,53 +467,99 @@ jobs:
 
           TREE="$(git write-tree)"
           MSG="$(cat <<EOF
-          Merge $CIP_TARGET_TAG into $SOURCE_BRANCH
+          Merge $CIP_TARGET_TAG into vendor $SOURCE_REF
 
           CIP: $CIP_BASE_TAG -> $CIP_TARGET_TAG (localversion-st $TARGET_ST)
-          All 23 conflicts resolved by the inline rules in this workflow.
+          All 23 conflicts resolved by inline rules in this workflow.
           EOF
           )"
           NEW_COMMIT="$(printf '%s\n' "$MSG" \
             | git commit-tree "$TREE" -p "$OURS" -p "$CIP_TARGET")"
+          log "merge commit: $NEW_COMMIT"
 
           if [ "$DRY_RUN" = "true" ]; then
-            log "dry run: would create merge commit $NEW_COMMIT on $TARGET_BRANCH"
-            log "dry run: skipping push and pull request"
+            log "dry run: skipping patch, tarball and release"
             exit 0
           fi
 
-          git update-ref "refs/heads/$TARGET_BRANCH" "$NEW_COMMIT"
-          git push --force origin "$NEW_COMMIT:refs/heads/$TARGET_BRANCH"
-          log "pushed $TARGET_BRANCH ($NEW_COMMIT)"
+          PATCH="$GITHUB_WORKSPACE/kernel-4.19.325-cip137.patch"
+          TARBALL="$GITHUB_WORKSPACE/kernel-4.19.325-cip137-src.tar.gz"
+          INFO="$GITHUB_WORKSPACE/merge-info.txt"
 
-          if [ "$OPEN_PR" = "true" ]; then
-            PR_COUNT="$(gh pr list --head "$TARGET_BRANCH" --base "$SOURCE_BRANCH" \
-              --json number --jq 'length')"
-            if [ "$PR_COUNT" != "0" ]; then
-              log "pull request for $TARGET_BRANCH already exists"
-            else
-              cat > "$TMP/pr.md" <<EOF
-          Automated merge of \`$CIP_TARGET_TAG\` (CIP $TARGET_CIP / ST $TARGET_ST) into \`$SOURCE_BRANCH\`.
+          git diff --binary --full-index "$OURS" "$NEW_COMMIT" > "$PATCH"
+          git archive --format=tar.gz --prefix=kernel/ "$NEW_COMMIT" > "$TARBALL"
 
-          - Merge base: \`$CIP_BASE_TAG\`, matching the localversion files on \`$SOURCE_BRANCH\`.
-          - 23 conflicts resolved by inline rules in the workflow; see the workflow source for rationale.
-          - No conflict markers remain; \`make kernelversion\` reports 4.19.325.
-          - Please review vendor-specific resolutions (MediaTek, sdcardfs, uclamp, BPF) before merging.
+          git worktree add --detach "$TMP/verify" "$OURS" >/dev/null
+          ( cd "$TMP/verify" && git apply --check "$PATCH" ) \
+            || fail "generated patch does not apply cleanly to the source tree"
+          git worktree remove --force "$TMP/verify"
+
+          cat > "$INFO" <<EOF
+          CIP merge result
+          =================
+          source repo : $SOURCE_REPO
+          source ref  : $SOURCE_REF
+          source sha  : $OURS
+          base tag    : $CIP_BASE_TAG
+          target tag  : $CIP_TARGET_TAG
+          merge commit: $NEW_COMMIT
+          versions    : $TARGET_CIP / $TARGET_ST
+          conflicts   : 23 resolved (inline workflow rules)
+          kernelversion: $(make -s kernelversion)
+
+          Files
+          -----
+          kernel-4.19.325-cip137.patch       - applies cleanly to $OURS
+          kernel-4.19.325-cip137-src.tar.gz  - full merged source tree
+
+          SHA256
+          ------
+          $(sha256sum "$PATCH" | cut -d' ' -f1)  patch
+          $(sha256sum "$TARBALL" | cut -d' ' -f1)  tarball
           EOF
-              gh pr create --base "$SOURCE_BRANCH" --head "$TARGET_BRANCH" \
-                --title "Merge $CIP_TARGET_TAG into $SOURCE_BRANCH" \
-                --body-file "$TMP/pr.md"
-              log "opened pull request"
-            fi
-          fi
 
-          log "done"
+          echo "merge_commit=$NEW_COMMIT" >> "$GITHUB_OUTPUT"
+          log "patch:   $PATCH"
+          log "tarball: $TARBALL"
+
+      - name: Upload patch and source tarball
+        if: ${{ inputs.dry-run == 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-cip137-merge
+          path: |
+            kernel-4.19.325-cip137.patch
+            kernel-4.19.325-cip137-src.tar.gz
+            merge-info.txt
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: ${{ inputs.dry-run == 'false' && inputs.create-release == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.CIP_MERGE_TOKEN || github.token }}
+          RELEASE_TAG_PREFIX: ${{ inputs.release-tag-prefix }}
+          SOURCE_REF: ${{ inputs.source-ref }}
+          CIP_TARGET_TAG: ${{ inputs.cip-target-tag }}
+          MERGE_COMMIT: ${{ steps.merge.outputs.merge_commit }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG_PREFIX}-$(date -u +%Y%m%d)-${SOURCE_REF:0:7}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; skipping"
+            exit 0
+          fi
+          gh release create "$TAG" \
+            "$GITHUB_WORKSPACE/kernel-4.19.325-cip137.patch" \
+            "$GITHUB_WORKSPACE/kernel-4.19.325-cip137-src.tar.gz" \
+            "$GITHUB_WORKSPACE/merge-info.txt" \
+            --title "CIP $CIP_TARGET_TAG on $SOURCE_REF" \
+            --notes-file "$GITHUB_WORKSPACE/merge-info.txt"
 
       - name: Summary
         if: always()
         run: |
           echo "### CIP merge" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Source: \`${{ inputs.source-branch }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Target: \`${{ inputs.target-branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source: \`${{ inputs.source-repo }}@${{ inputs.source-ref }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- CIP: \`${{ inputs.cip-base-tag }}\` -> \`${{ inputs.cip-target-tag }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Conflicts: 23, resolved inline (no extra files needed)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Conflicts: 23 resolved inline" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Merge commit: \`${{ steps.merge.outputs.merge_commit }}\`" >> "$GITHUB_STEP_SUMMARY"

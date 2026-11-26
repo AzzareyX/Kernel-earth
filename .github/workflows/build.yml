@@ -38,6 +38,36 @@ on:
         required: false
         default: 'v4.19.325-perf-cip137-st21'
         type: string
+      build-kernel:
+        description: 'Build the merged kernel and create a flashable AnyKernel3 zip'
+        required: false
+        default: true
+        type: boolean
+      defconfig:
+        description: 'Kernel defconfig to build'
+        required: false
+        default: 'earth_defconfig'
+        type: string
+      cross-compile:
+        description: 'Cross compiler prefix'
+        required: false
+        default: 'aarch64-linux-gnu-'
+        type: string
+      anykernel-repo:
+        description: 'AnyKernel3 repository'
+        required: false
+        default: 'https://github.com/osm0sis/AnyKernel3.git'
+        type: string
+      anykernel-branch:
+        description: 'AnyKernel3 branch'
+        required: false
+        default: 'master'
+        type: string
+      flashable-zip-name:
+        description: 'Filename for the flashable zip'
+        required: false
+        default: 'AnyKernel3-earth-cip137-st21.zip'
+        type: string
 
 permissions:
   contents: write
@@ -522,25 +552,125 @@ jobs:
           log "patch:   $PATCH"
           log "tarball: $TARBALL"
 
-      - name: Upload patch and source tarball
-        if: ${{ inputs.dry-run == 'false' }}
+      - name: Build kernel and create flashable AnyKernel3 zip
+        id: flashable
+        if: ${{ inputs.dry-run == false && inputs.build-kernel == true }}
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+          CROSS_COMPILE: ${{ inputs.cross-compile }}
+          ANYKERNEL_REPO: ${{ inputs.anykernel-repo }}
+          ANYKERNEL_BRANCH: ${{ inputs.anykernel-branch }}
+          ZIP_NAME: ${{ inputs.flashable-zip-name }}
+          SOURCE_REF: ${{ inputs.source-ref }}
+        run: |
+          set -euo pipefail
+
+          log()  { printf '[flashable] %s\n' "$*"; }
+          fail() { printf '[flashable] ERROR: %s\n' "$*" >&2; exit 1; }
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu zip
+
+          KDIR="$GITHUB_WORKSPACE/kernel"
+          OUT="$GITHUB_WORKSPACE/out"
+          AK="$GITHUB_WORKSPACE/AnyKernel3"
+          ZIP="$GITHUB_WORKSPACE/$ZIP_NAME"
+
+          log "configuring $DEFCONFIG"
+          mkdir -p "$OUT"
+          make -C "$KDIR" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" \
+            O="$OUT" "$DEFCONFIG"
+
+          log "building kernel with -j$(nproc)"
+          make -C "$KDIR" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" \
+            O="$OUT" -j"$(nproc)"
+
+          KIMG="$OUT/arch/arm64/boot/Image.gz-dtb"
+          if [ ! -f "$KIMG" ]; then
+            KIMG="$OUT/arch/arm64/boot/Image.gz"
+          fi
+          [ -f "$KIMG" ] || fail "no Image.gz-dtb or Image.gz was produced"
+          log "kernel image: $KIMG"
+
+          log "cloning AnyKernel3 from $ANYKERNEL_REPO ($ANYKERNEL_BRANCH)"
+          rm -rf "$AK"
+          git clone --depth=1 -b "$ANYKERNEL_BRANCH" \
+            "$ANYKERNEL_REPO" "$AK"
+
+          cp "$KIMG" "$AK/Image.gz-dtb"
+
+          CIP_VER="$(cat "$KDIR/localversion-cip")"
+          ST_VER="$(cat "$KDIR/localversion-st")"
+
+          cat > "$AK/anykernel.sh" <<EOF
+          ### AnyKernel3 Ramdisk Mod Script
+          ## Kernel-earth CIP flashable zip
+
+          properties() { '
+          kernel.string=Kernel-earth ${CIP_VER} ${ST_VER} by AzzareyX (${SOURCE_REF:0:7})
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=earth
+          device.name2=redmi12c
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          BLOCK=boot
+          IS_SLOT_DEVICE=auto
+          RAMDISK_COMPRESSION=auto
+          PATCH_VBMETA_FLAG=auto
+
+          . tools/ak3-core.sh
+
+          dump_boot
+          write_boot
+          EOF
+
+          chmod 755 "$AK/anykernel.sh"
+          ( cd "$AK" && zip -r9 "$ZIP" . -x '.git*' >/dev/null )
+          [ -f "$ZIP" ] || fail "zip was not created"
+          log "flashable zip: $ZIP ($(du -h "$ZIP" | cut -f1))"
+
+          cat >> "$GITHUB_WORKSPACE/merge-info.txt" <<EOF
+
+          Flashable AnyKernel3 zip
+          ------------------------
+          file       : $ZIP_NAME
+          kernel     : $(basename "$KIMG")
+          version    : ${CIP_VER} ${ST_VER}
+          sha256     : $(sha256sum "$ZIP" | cut -d' ' -f1)
+          block      : boot (auto slot detection)
+          devicecheck: disabled (earth / redmi12c)
+          EOF
+
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Upload patch, source tarball and flashable zip
+        if: ${{ inputs.dry-run == false }}
         uses: actions/upload-artifact@v4
         with:
           name: kernel-cip137-merge
           path: |
             kernel-4.19.325-cip137.patch
             kernel-4.19.325-cip137-src.tar.gz
+            ${{ inputs.flashable-zip-name }}
             merge-info.txt
           if-no-files-found: error
 
       - name: Create GitHub Release
-        if: ${{ inputs.dry-run == 'false' && inputs.create-release == 'true' }}
+        if: ${{ inputs.dry-run == false && inputs.create-release == true }}
         env:
           GH_TOKEN: ${{ secrets.CIP_MERGE_TOKEN || github.token }}
           RELEASE_TAG_PREFIX: ${{ inputs.release-tag-prefix }}
           SOURCE_REF: ${{ inputs.source-ref }}
           CIP_TARGET_TAG: ${{ inputs.cip-target-tag }}
           MERGE_COMMIT: ${{ steps.merge.outputs.merge_commit }}
+          ZIP_NAME: ${{ inputs.flashable-zip-name }}
         run: |
           set -euo pipefail
           TAG="${RELEASE_TAG_PREFIX}-$(date -u +%Y%m%d)-${SOURCE_REF:0:7}"
@@ -548,10 +678,15 @@ jobs:
             echo "release $TAG already exists; skipping"
             exit 0
           fi
-          gh release create "$TAG" \
-            "$GITHUB_WORKSPACE/kernel-4.19.325-cip137.patch" \
-            "$GITHUB_WORKSPACE/kernel-4.19.325-cip137-src.tar.gz" \
-            "$GITHUB_WORKSPACE/merge-info.txt" \
+          ASSETS=(
+            "$GITHUB_WORKSPACE/kernel-4.19.325-cip137.patch"
+            "$GITHUB_WORKSPACE/kernel-4.19.325-cip137-src.tar.gz"
+            "$GITHUB_WORKSPACE/merge-info.txt"
+          )
+          if [ -f "$GITHUB_WORKSPACE/$ZIP_NAME" ]; then
+            ASSETS+=("$GITHUB_WORKSPACE/$ZIP_NAME")
+          fi
+          gh release create "$TAG" "${ASSETS[@]}" \
             --title "CIP $CIP_TARGET_TAG on $SOURCE_REF" \
             --notes-file "$GITHUB_WORKSPACE/merge-info.txt"
 
@@ -563,3 +698,10 @@ jobs:
           echo "- CIP: \`${{ inputs.cip-base-tag }}\` -> \`${{ inputs.cip-target-tag }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Conflicts: 23 resolved inline" >> "$GITHUB_STEP_SUMMARY"
           echo "- Merge commit: \`${{ steps.merge.outputs.merge_commit }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Flashable zip: \`${{ inputs.flashable-zip-name }}\` (build-kernel: \`${{ inputs.build-kernel }}\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- dry-run: \`${{ inputs.dry-run }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Files in workspace:" >> "$GITHUB_STEP_SUMMARY"
+          ls -lh "$GITHUB_WORKSPACE"/kernel-4.19.325-cip137.patch \
+            "$GITHUB_WORKSPACE"/kernel-4.19.325-cip137-src.tar.gz \
+            "$GITHUB_WORKSPACE"/merge-info.txt 2>/dev/null \
+            | sed 's/^/  - /' >> "$GITHUB_STEP_SUMMARY" || echo "  - (none; dry-run=true or merge step failed)" >> "$GITHUB_STEP_SUMMARY"

@@ -42,6 +42,14 @@ on:
           - merge
           - cherry-pick
           - rebase
+      auto_resolve:
+        description: 'Coba auto-resolve 23 konflik CIP yang sudah dikenal sebelum membatalkan build'
+        required: true
+        type: choice
+        default: 'true'
+        options:
+          - 'true'
+          - 'false'
       defconfig:
         description: 'Defconfig kernel (arch/arm64/configs/<nama>)'
         required: true
@@ -244,29 +252,47 @@ jobs:
           capture_conflict() {
             local reason="$1"
             {
-              echo "CIP upgrade FAILED"
+              echo "CIP upgrade CONFLICT"
               echo "Reason        : $reason"
               echo "Source        : $SOURCE_REPO @ $SOURCE_BRANCH"
               echo "Source HEAD   : ${{ steps.clone.outputs.source_sha }}"
               echo "CIP target    : ${{ steps.meta.outputs.cip_tag }} ($(git rev-parse "$CIP_TARGET"))"
               echo "Mode          : $MERGE_MODE"
+              echo "Auto-resolve  : ${{ inputs.auto_resolve }}"
               echo "Runner        : $RUNNER_OS / $RUNNER_ARCH"
               echo ""
               echo "Build sengaja DIBATALKAN. Selesaikan konflik dulu, lalu jalankan ulang workflow."
             } > "$CONFLICT_DIR/00-summary.txt"
 
-            git status --short 2>/dev/null | head -n 300 > "$CONFLICT_DIR/01-git-status.txt" || true
-            git diff --name-only --diff-filter=U 2>/dev/null | head -n 300 > "$CONFLICT_DIR/02-unmerged-paths.txt" || true
-            git diff --no-ext-diff 2>/dev/null | head -n 5000 > "$CONFLICT_DIR/03-conflict-diff.patch" || true
+            git status --porcelain=v2 --untracked-files=normal 2>/dev/null \
+              | head -n 400 > "$CONFLICT_DIR/01-git-status.txt" || true
+            git diff --name-only --diff-filter=U 2>/dev/null \
+              | head -n 300 > "$CONFLICT_DIR/02-unmerged-paths.txt" || true
+            git diff --no-ext-diff 2>/dev/null \
+              | head -n 5000 > "$CONFLICT_DIR/03-conflict-diff.patch" || true
             git ls-files -u 2>/dev/null | head -n 500 > "$CONFLICT_DIR/04-unmerged-index.txt" || true
             git log --oneline --decorate -20 2>/dev/null > "$CONFLICT_DIR/05-recent-log.txt" || true
             (git merge-base HEAD "$CIP_TARGET" 2>/dev/null || echo "NO_COMMON_ANCESTOR") \
               > "$CONFLICT_DIR/06-merge-base.txt" || true
+            git diff --stat 2>/dev/null | tail -n 250 > "$CONFLICT_DIR/07-diff-stat.txt" || true
+            git diff --check 2>/dev/null | head -n 400 > "$CONFLICT_DIR/08-diff-check.txt" || true
 
-            echo "apply_status=failed" >> "$GITHUB_OUTPUT"
-            echo "### :x: Konflik saat menerapkan \`${{ steps.meta.outputs.cip_tag }}\` (\`$reason\`)" >> "$GITHUB_STEP_SUMMARY"
-            echo "Unduh artifact **cip-conflict-logs** untuk detail (`00-summary.txt`, `01-git-status.txt`, `02-unmerged-paths.txt`, `03-conflict-diff.patch`)." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
+            # Snapshot stage 2 (HEAD/vendor) vs stage 3 (CIP) per file, dipotong kecil.
+            local n=0 tag f
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              n=$((n + 1))
+              [ "$n" -le 30 ] || break
+              tag="$(printf '%s' "$f" | tr '/ ' '__')"
+              git show ":2:$f" 2>/dev/null | head -n 160 > "$CONFLICT_DIR/ours_${tag}.txt" || true
+              git show ":3:$f" 2>/dev/null | head -n 160 > "$CONFLICT_DIR/theirs_${tag}.txt" || true
+            done < "$CONFLICT_DIR/02-unmerged-paths.txt"
+
+            echo "apply_status=conflict" >> "$GITHUB_OUTPUT"
+            echo "### :warning: Konflik saat menerapkan \`${{ steps.meta.outputs.cip_tag }}\` (\`$reason\`)" >> "$GITHUB_STEP_SUMMARY"
+            echo "Auto-resolve akan dicoba: \`${{ inputs.auto_resolve }}\`. Jika gagal, unduh artifact **cip-conflict-logs**." >> "$GITHUB_STEP_SUMMARY"
+            APPLY_CONFLICT=1
+            return 0
           }
 
           if [ "$MERGE_MODE" = "merge" ]; then
@@ -317,12 +343,193 @@ jobs:
             done
           fi
 
+          # Jangan menimpa status "conflict" dengan "ok" setelah return dari capture_conflict.
+          if [ "${APPLY_CONFLICT:-0}" = "1" ]; then
+            exit 0
+          fi
+
           echo "apply_status=ok" >> "$GITHUB_OUTPUT"
           git diff --binary "origin/$SOURCE_BRANCH..HEAD" > "$GITHUB_WORKSPACE/cip-upgrade.patch" || true
           echo "### :white_check_mark: CIP \`${{ steps.meta.outputs.cip_tag }}\` berhasil diterapkan (mode: \`$MERGE_MODE\`)" >> "$GITHUB_STEP_SUMMARY"
 
+      # ------------------------------------------------------------------
+      # 3b. Auto-resolve konflik yang sudah dikenal (23 file earth lineage-23.2)
+      # ------------------------------------------------------------------
+      - name: Auto-resolve known CIP conflicts
+        id: resolve
+        if: steps.apply.outputs.apply_status == 'conflict' && inputs.auto_resolve
+        run: |
+          set -uo pipefail
+          cd "$WORKDIR"
+
+          # Resolver ditulis inline supaya workflow tidak bergantung pada file
+          # yang harus di-commit lebih dulu ke repo kernel.
+          cat > "$RUNNER_TEMP/resolve_cip.py" <<'PY'
+          import pathlib, re, sys
+          R = pathlib.Path(sys.argv[1])
+          P = re.compile(r'(?ms)^<<<<<<< HEAD\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*\n')
+          def r(n, k, v=None): return (n, k, v)
+
+          kabi = ('#if IS_ENABLED(CONFIG_DEBUG_SPINLOCK) || IS_ENABLED(CONFIG_DEBUG_LOCK_ALLOC)\n'
+                  '\tANDROID_KABI_RESERVE(1);\n#else\n'
+                  '\tANDROID_KABI_USE(1, spinlock_t sk_peer_lock);\n#endif\n'
+                  '#if IS_ENABLED(CONFIG_PROVE_LOCKING) && IS_ENABLED(CONFIG_MODULES)\n'
+                  '\tANDROID_KABI_USE(2, struct module *sk_owner);\n#else\n'
+                  '\tANDROID_KABI_RESERVE(2);\n#endif\n'
+                  + ''.join('\tANDROID_KABI_RESERVE(%d);\n' % i for i in range(3, 9)))
+
+          RULES = {
+          'drivers/gpu/drm/virtio/virtgpu_ioctl.c':[r('drm_gem_object_release(obj)','text','\t\tdrm_gem_object_put_unlocked(obj);\n')],
+          'drivers/input/evdev.c':[r('ktime_get_boottime','ours')],
+          'drivers/net/ethernet/stmicro/stmmac/dwxgmac2.h':[r('XGMAC_DMA_INT_DEFAULT_EN','ours')],
+          'drivers/net/ethernet/stmicro/stmmac/ring_mode.c':[r('rx_q->priv_data','theirs')],
+          'drivers/usb/gadget/function/f_fs.c':[r('smp_mb__before_atomic','ours')],
+          'drivers/usb/gadget/function/f_hid.c':[r('hidg->report_desc = kmemdup','both')],
+          'drivers/usb/gadget/udc/core.c':[
+            r('sysfs_remove_link(&udc->dev.kobj','text',
+              '\tspin_lock_irqsave(&gadget->state_lock, flags);\n'
+              '\tgadget->teardown = true;\n'
+              '\tspin_unlock_irqrestore(&gadget->state_lock, flags);\n'
+              '\tsysfs_remove_link(&udc->dev.kobj, "gadget");\n'),
+            r('spin_lock_irqsave(&gadget->state_lock','theirs')],
+          'drivers/usb/host/xhci-hub.c':[r('run_graceperiod','theirs')],
+          'fs/Makefile':[r('fs_context.o','text','\t\tfs_context.o fs_parser.o fs_types.o\n')],
+          'fs/f2fs/super.c':[r('Need to recover fsync data','text',
+              '\t\tif (err > 0) {\n\t\t\tif (!f2fs_readonly(sb)) {\n'
+              '\t\t\t\tf2fs_err(sbi, "Need to recover fsync data");\n'
+              '\t\t\t\terr = -EINVAL;\n\t\t\t\tgoto free_meta;\n'
+              '\t\t\t} else {\n\t\t\t\tf2fs_msg(sb, KERN_INFO, "drop all fsynced data");\n'
+              '\t\t\t\terr = 0;\n\t\t\t}\n\t\t}\n')],
+          'fs/f2fs/sysfs.c':[
+            r('avg_vblocks_show','both'),
+            r('return sprintf(buf, "%u\\n", *ui);','theirs'),
+            r('iostat_period_ms','text',
+              '\tif (!strcmp(a->attr.name, "iostat_period_ms")) {\n'
+              '\t\tif (t < MIN_IOSTAT_PERIOD_MS || t > MAX_IOSTAT_PERIOD_MS)\n'
+              '\t\t\treturn -EINVAL;\n\t\tspin_lock(&sbi->iostat_lock);\n'
+              '\t\tsbi->iostat_period_ms = (unsigned int)t;\n'
+              '\t\tspin_unlock(&sbi->iostat_lock);\n\t\treturn count;\n\t}\n\n'
+              '\t__sbi_store_value(a, sbi, ptr + a->offset, t);\n')],
+          'fs/jbd2/transaction.c':[r('rwsem_acquire_read','theirs')],
+          'include/linux/bpf.h':[r('owner_prog_type','text',
+              '\tstruct bpf_array_aux *aux;\n\tenum bpf_prog_type owner_prog_type;\n'
+              '\tbool owner_jited;\n\tenum bpf_attach_type owner_attach_type;\n')],
+          'include/linux/fs.h':[r('android_kabi.h','text',
+              '#include <linux/android_kabi.h>\n#include <linux/fs_types.h>\n')],
+          'include/net/sock.h':[r('ANDROID_KABI_USE(1, spinlock_t sk_peer_lock)','text',kabi)],
+          'kernel/bpf/core.c':[r('array->aux->owner','text',
+              '\t\tarray->owner_prog_type = fp->type;\n\t\tarray->owner_jited = fp->jited;\n'
+              '\t\tarray->owner_attach_type = fp->expected_attach_type;\n\n'
+              '\t\treturn true;\n\t}\n\n'
+              '\treturn array->owner_prog_type == fp->type &&\n'
+              '\t       array->owner_jited == fp->jited &&\n'
+              '\t       array->owner_attach_type == fp->expected_attach_type;\n')],
+          'kernel/bpf/local_storage.c':[r('list_next_entry(storage, list_map)','text',
+              '\t\tstorage = list_next_entry(storage, list_map);\n'
+              '\t\tif (list_entry_is_head(storage, &map->list, list_map))\n')],
+          'kernel/sched/core.c':[r('uclamp_post_fork','text',
+              'void sched_post_fork(struct task_struct *p)\n{\n\tuclamp_post_fork(p);\n}\n\n'
+              'u64 to_ratio(u64 period, u64 runtime)\n')],
+          'kernel/sched/cpufreq_schedutil.c':[
+            r('sg_policy->up_rate_delay_ns','ours'),
+            r('sugov_update_rate_limit_us(sg_policy);','ours')],
+          'mm/swapfile.c':[r('IS_SWAPFILE(inode)','text',
+              '\tinode_lock(inode);\n\tif (IS_SWAPFILE(inode)) {\n'
+              '\t\terror = -EBUSY;\n\t\tgoto bad_swap_unlock_inode;\n\t}\n'
+              '\tif (IS_ENCRYPTED(inode)) {\n\t\tpr_warn_once(\n'
+              '\t\t\t"Filesystem-level encrypted swapfile \'%s\' is unsupported. Create a loop device over it, or use dm-crypt\\n",\n'
+              '\t\t\tname->name);\n\t\terror = -EINVAL;\n'
+              '\t\tgoto bad_swap_unlock_inode;\n\t}\n\n')],
+          'net/core/filter.c':[
+            r('sizeof_field(OBJ, OBJ_FIELD)','theirs'),
+            r('SOCK_OPS_GET_SK()','theirs')],
+          'sound/core/pcm_lib.c':[r('Modified by MTK','theirs')],
+          'virt/kvm/arm/mmu.c':[r('mmap_read_unlock(current->mm);','theirs')],
+          }
+          POST = {
+          'kernel/sched/sched.h':[('unsigned long to_ratio(','u64 to_ratio(')],
+          'drivers/net/ethernet/stmicro/stmmac/ring_mode.c':[
+            ('static void refill_desc3(void *priv_ptr, struct dma_desc *p)',
+             'static void refill_desc3(struct stmmac_rx_queue *rx_q, struct dma_desc *p)')],
+          }
+          def render(k, o, t, v):
+              if k == 'ours': return o
+              if k == 'theirs': return t
+              if k == 'both': return o.rstrip('\n') + '\n\n' + t.lstrip('\n')
+              return v
+          bad = []
+          for path, rules in RULES.items():
+              p = R / path
+              if not p.is_file():
+                  bad.append('MISSING ' + path); continue
+              s = p.read_text(); ms = list(P.finditer(s))
+              if not ms: continue
+              out = []; pos = 0
+              for m in ms:
+                  o, t = m.group(1), m.group(2)
+                  pick = next(((k, v) for n, k, v in rules if n in o + t), None)
+                  if pick is None:
+                      bad.append('UNHANDLED ' + path); continue
+                  out += [s[pos:m.start()], render(pick[0], o, t, pick[1])]
+                  pos = m.end()
+              out.append(s[pos:]); p.write_text(''.join(out))
+          for path, subs in POST.items():
+              p = R / path
+              if p.is_file():
+                  s = p.read_text()
+                  for a, b in subs: s = s.replace(a, b)
+                  p.write_text(s)
+          if bad:
+              print('\n'.join(bad)); sys.exit(1)
+          print('AUTO_RESOLVE_OK')
+          PY
+
+          if python3 "$RUNNER_TEMP/resolve_cip.py" "$WORKDIR" 2>&1 | tee "$CONFLICT_DIR/09-auto-resolve.log"; then
+            RESOLVER_RC=0
+          else
+            RESOLVER_RC=1
+          fi
+
+          UNMERGED="$(git diff --name-only --diff-filter=U | wc -l)"
+          MARKERS=0
+          for f in $(git diff --name-only --diff-filter=U); do
+            if grep -q -E '^(<<<<<<< HEAD|=======|>>>>>>>)' "$f"; then
+              MARKERS=$((MARKERS + 1))
+            fi
+          done
+          {
+            echo "resolver_rc=$RESOLVER_RC"
+            echo "unmerged_paths=$UNMERGED"
+            echo "files_with_markers=$MARKERS"
+          } > "$CONFLICT_DIR/10-resolve-check.txt" || true
+
+          FINAL=ok
+          if [ "$RESOLVER_RC" -ne 0 ] || [ "$UNMERGED" -ne 0 ] || [ "$MARKERS" -ne 0 ]; then
+            FINAL=failed
+          else
+            git add -A
+            if [ "$MERGE_MODE" = "merge" ]; then
+              git -c core.editor=true merge --continue
+            elif [ "$MERGE_MODE" = "rebase" ]; then
+              git -c core.editor=true rebase --continue
+            else
+              git -c core.editor=true cherry-pick --continue || true
+              git -c core.editor=true cherry-pick --quit >/dev/null 2>&1 || true
+            fi
+            [ "$(git diff --name-only --diff-filter=U | wc -l)" -eq 0 ] || FINAL=failed
+          fi
+
+          if [ "$FINAL" = "ok" ]; then
+            echo "resolve_status=ok" >> "$GITHUB_OUTPUT"
+            echo "### :white_check_mark: Auto-resolve berhasil; merge dilanjutkan dan build diproses" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "resolve_status=failed" >> "$GITHUB_OUTPUT"
+            echo "::error::Auto-resolve gagal. $UNMERGED path unmerged, $MARKERS file masih punya marker."
+            echo "### :x: Auto-resolve gagal; build dibatalkan" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload conflict diagnostics
-        if: failure() && steps.apply.outputs.apply_status == 'failed'
+        if: always() && steps.apply.outputs.apply_status == 'conflict' && steps.resolve.outputs.resolve_status != 'ok'
         uses: actions/upload-artifact@v4
         with:
           name: cip-conflict-logs
@@ -331,11 +538,17 @@ jobs:
           compression-level: 9
           if-no-files-found: warn
 
+      - name: Abort when conflicts remain
+        if: steps.apply.outputs.apply_status == 'conflict' && steps.resolve.outputs.resolve_status != 'ok'
+        run: |
+          echo "::error::Konflik belum selesai. Unduh artifact cip-conflict-logs dan selesaikan manual."
+          exit 1
+
       # ------------------------------------------------------------------
       # 4. Setup toolchain + ccache masquerade, lalu build
       # ------------------------------------------------------------------
       - name: Build kernel with ccache
-        if: success()
+        if: success() && (steps.apply.outputs.apply_status == 'ok' || steps.resolve.outputs.resolve_status == 'ok')
         env:
           SOURCE_SHA: ${{ steps.clone.outputs.source_sha }}
           CIP_TAG: ${{ steps.meta.outputs.cip_tag }}
@@ -420,7 +633,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Package AnyKernel3 flashable zip
         id: package
-        if: success()
+        if: success() && (steps.apply.outputs.apply_status == 'ok' || steps.resolve.outputs.resolve_status == 'ok')
         run: |
           set -euo pipefail
           IMAGE="$(cat "$GITHUB_WORKSPACE/image-name.txt")"
@@ -445,7 +658,7 @@ jobs:
           echo "### :package: Flashable zip: \`$(basename "$ZIP")\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload flashable zip, patch, and build info
-        if: success()
+        if: success() && (steps.apply.outputs.apply_status == 'ok' || steps.resolve.outputs.resolve_status == 'ok')
         uses: actions/upload-artifact@v4
         with:
           name: kernel-${{ inputs.device_codename }}-${{ steps.meta.outputs.version }}

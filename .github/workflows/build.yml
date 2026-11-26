@@ -472,6 +472,19 @@ jobs:
           with open(cpu, "w", encoding="utf-8") as f:
               f.write(s)
           print("[cip-merge] applied CIP rate-limit overflow fix")
+
+          # Vendor BPF trace helper uses varargs; GCC rejects 'static inline' here.
+          trace = "kernel/trace/bpf_trace.c"
+          old = "static inline __printf(1, 0) int bpf_do_trace_printk(const char *fmt, ...)"
+          new = "static __printf(1, 0) int bpf_do_trace_printk(const char *fmt, ...)"
+          if os.path.exists(trace):
+              with open(trace, "r", encoding="utf-8") as f:
+                  s = f.read()
+              if old in s:
+                  s = s.replace(old, new, 1)
+                  with open(trace, "w", encoding="utf-8") as f:
+                      f.write(s)
+                  print("[cip-merge] made bpf_do_trace_printk non-inline for GCC")
           PY
 
           printf '%s\n' "$TARGET_CIP" > localversion-cip

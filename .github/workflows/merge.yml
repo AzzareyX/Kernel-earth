@@ -452,24 +452,18 @@ jobs:
           'drivers/net/ethernet/stmicro/stmmac/ring_mode.c':[
             ('static void refill_desc3(void *priv_ptr, struct dma_desc *p)',
              'static void refill_desc3(struct stmmac_rx_queue *rx_q, struct dma_desc *p)')],
-          # vendor f2fs helper: f2fs_err(sbi, ...) ada, f2fs_msg(sb, ...) tidak ada
-          'fs/f2fs/super.c':[
-            ('reset_checkpoint:\n\t/* f2fs_recover_fsync_data() cleared this already */',
-             'reset_checkpoint:\n\tskip_recovery:\n'
-             '\t/* f2fs_recover_fsync_data() cleared this already */'),
-            ('f2fs_msg(sbi->sb, KERN_ERR,', 'f2fs_err(sbi,'),
-            ('f2fs_msg(sbi->sb, KERN_INFO,', 'f2fs_err(sbi,'),
-            ('f2fs_msg(sb, KERN_ERR,', 'f2fs_err(sbi,'),
-            ('f2fs_msg(sb, KERN_INFO,', 'f2fs_err(sbi,')],
-          'fs/f2fs/sysfs.c':[
-            ('f2fs_msg(sbi->sb, KERN_ERR,', 'f2fs_err(sbi,'),
-            ('f2fs_msg(sbi->sb, KERN_INFO,', 'f2fs_err(sbi,'),
-            ('f2fs_msg(sb, KERN_ERR,', 'f2fs_err(sbi,'),
-            ('f2fs_msg(sb, KERN_INFO,', 'f2fs_err(sbi,')],
           # schedutil: pakai nama field vendor/MediaTek, bukan CIP murni
           'kernel/sched/cpufreq_schedutil.c':[
             ('freq_update_delay_ns', 'up_rate_delay_ns'),
             ('tunables->rate_limit_us', 'tunables->up_rate_limit_us')],
+          # bpf_trace: static inline + varargs ditolak toolchain gcc-12
+          'kernel/trace/bpf_trace.c':[
+            ('static inline __printf(1, 0) int bpf_do_trace_printk(',
+             'static __printf(1, 0) int bpf_do_trace_printk(')],
+          # blk-crypto: CIP menyisakan deklarasi inline tanpa body
+          'include/linux/keyslot-manager.h':[
+            ('inline void ksm_', 'void ksm_'),
+            ('inline int ksm_', 'int ksm_')],
           }
           def render(k, o, t, v):
               if k == 'ours': return o
@@ -504,6 +498,25 @@ jobs:
                   s = p.read_text()
                   for a, b in subs: s = s.replace(a, b)
                   p.write_text(s)
+          # f2fs_msg(sb, level, ...) tidak ada di vendor tree. CIP menyisipkannya
+          # di file non-konflik juga (mis. checkpoint.c), jadi sweep semua file.
+          F2FS_MSG = [
+            ('f2fs_msg(sbi->sb, KERN_ERR,', 'f2fs_err(sbi,'),
+            ('f2fs_msg(sbi->sb, KERN_WARNING,', 'f2fs_err(sbi,'),
+            ('f2fs_msg(sbi->sb, KERN_NOTICE,', 'f2fs_err(sbi,'),
+            ('f2fs_msg(sbi->sb, KERN_INFO,', 'f2fs_err(sbi,'),
+            ('f2fs_msg(sbi->sb, KERN_DEBUG,', 'f2fs_err(sbi,'),
+            ('f2fs_msg(sb, KERN_ERR,', 'f2fs_err(F2FS_SB(sb),'),
+            ('f2fs_msg(sb, KERN_WARNING,', 'f2fs_err(F2FS_SB(sb),'),
+            ('f2fs_msg(sb, KERN_NOTICE,', 'f2fs_err(F2FS_SB(sb),'),
+            ('f2fs_msg(sb, KERN_INFO,', 'f2fs_err(F2FS_SB(sb),'),
+            ('f2fs_msg(sb, KERN_DEBUG,', 'f2fs_err(F2FS_SB(sb),')]
+          for p in sorted((R / 'fs/f2fs').glob('*.[ch]')):
+              s = p.read_text(); old = s
+              for a, b in F2FS_MSG: s = s.replace(a, b)
+              if s != old:
+                  p.write_text(s)
+                  print('POST-FIX: %s (f2fs_msg)' % p.relative_to(R))
           # CIP memanggil sugov_update_rate_limit_us(); pastikan helper itu ada
           # dan memakai field vendor (up_rate_limit_us / up_rate_delay_ns).
           p = R / 'kernel/sched/cpufreq_schedutil.c'

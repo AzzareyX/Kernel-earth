@@ -358,6 +358,10 @@ def main():
             ('mtk_v4l2_err("[%d]Error!!src_buf is NULL!");',
              'mtk_v4l2_err("Error!!src_buf is NULL!");'),
         ],
+        "drivers/media/platform/mtk-vcodec/mtk_vcodec_enc.c": [
+            ('mtk_v4l2_err("dma_buf_map_attachment fail %d.\\n", sgt);',
+             'mtk_v4l2_err("dma_buf_map_attachment fail %p.\\n", sgt);'),
+        ],
     }
     for path, subs in post.items():
         p = ROOT / path
@@ -451,18 +455,62 @@ def main():
             cb = cip_src.index("\nstatic u32 sk_skb_convert_ctx_access(", ca)
             fn = cip_src[ca:cb]
 
-            sk_macro = (
-                "#define SOCK_OPS_GET_SK()"
-                " do { \\\n"
-                "\t*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF("
-                "struct bpf_sock_ops_kern, sk), \\\n"
-                "\t\t\t\t      si->dst_reg, si->src_reg, \\\n"
-                "\t\t\t\t      offsetof(struct bpf_sock_ops_kern, sk)); \\\n"
-                "} while (0)\n\n"
+            head_src = subprocess.check_output(
+                ["git", "-C", str(ROOT), "show", "HEAD:net/core/filter.c"],
+                text=True)
+
+            # CIP menyamakan sizeof(bpf_sock_ops.op) dengan kern.op, tetapi
+            # vendor memakai u8 di kern (UAPI u32). Ambil case op/reply dari
+            # HEAD supaya BUILD_BUG_ON tidak gagal dan offset tetap benar.
+            cip_op = (
+                "\tcase offsetof(struct bpf_sock_ops, op) ...\n"
+                "\t     offsetof(struct bpf_sock_ops, replylong[3]):\n"
+                "\t\tBUILD_BUG_ON(FIELD_SIZEOF(struct bpf_sock_ops, op) !=\n"
+                "\t\t\t     FIELD_SIZEOF(struct bpf_sock_ops_kern, op));\n"
+                "\t\tBUILD_BUG_ON(FIELD_SIZEOF(struct bpf_sock_ops, reply) !=\n"
+                "\t\t\t     FIELD_SIZEOF(struct bpf_sock_ops_kern, reply));\n"
+                "\t\tBUILD_BUG_ON(FIELD_SIZEOF(struct bpf_sock_ops, replylong) !=\n"
+                "\t\t\t     FIELD_SIZEOF(struct bpf_sock_ops_kern, replylong));\n"
+                "\t\toff = si->off;\n"
+                "\t\toff -= offsetof(struct bpf_sock_ops, op);\n"
+                "\t\toff += offsetof(struct bpf_sock_ops_kern, op);\n"
+                "\t\tif (type == BPF_WRITE)\n"
+                "\t\t\t*insn++ = BPF_STX_MEM(BPF_W, si->dst_reg, si->src_reg,\n"
+                "\t\t\t\t\t      off);\n"
+                "\t\telse\n"
+                "\t\t\t*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,\n"
+                "\t\t\t\t\t      off);\n"
+                "\t\tbreak;\n\n"
             )
+            ha = head_src.index("\tcase offsetof(struct bpf_sock_ops, op):")
+            hb = head_src.index("\tcase offsetof(struct bpf_sock_ops, family):", ha)
+            if cip_op in fn:
+                fn = fn.replace(cip_op, head_src[ha:hb], 1)
+
+            # Makro vendor menyelamatkan R9/register lain saat dst == src;
+            # makro CIP menghapusnya. Kembalikan versi vendor.
+            def macro_of(head, start, end):
+                a = head.index(start)
+                return head[a:head.index(end, a)]
+
+            head_get = macro_of(head_src, "#define SOCK_OPS_GET_FIELD(",
+                                "\n#define SOCK_OPS_GET_SK()")
+            head_sk = macro_of(head_src, "#define SOCK_OPS_GET_SK()",
+                               "\n#define SOCK_OPS_GET_TCP_SOCK_FIELD(")
+            head_set = macro_of(head_src, "#define SOCK_OPS_SET_FIELD(",
+                                "\n#define SOCK_OPS_GET_OR_SET_FIELD(")
+
+            ga = fn.index("#define SOCK_OPS_GET_FIELD(")
+            gb = fn.index("\n\n\tswitch (si->off) {", ga)
+            fn = fn[:ga] + "#undef SOCK_OPS_GET_FIELD\n" + head_get + fn[gb:]
+
+            sa = fn.index("#define SOCK_OPS_SET_FIELD(")
+            sb = fn.index("\n\n#define SOCK_OPS_GET_OR_SET_FIELD(", sa)
+            fn = fn[:sa] + "#undef SOCK_OPS_SET_FIELD\n" + head_set + fn[sb:]
+
             if "/* Helper macro for adding read access" in fn:
                 fn = fn.replace("/* Helper macro for adding read access",
-                                sk_macro + "/* Helper macro for adding read access", 1)
+                                head_sk + "/* Helper macro for adding read access", 1)
 
             vendor_cases = (
                 "\tcase offsetof(struct bpf_sock_ops, sk):\n"

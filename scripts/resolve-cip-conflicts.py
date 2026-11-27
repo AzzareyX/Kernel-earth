@@ -370,6 +370,11 @@ def main():
             ("memset(max_load, 0, ARRAY_SIZE(count_ack));",
              "memset(max_load, 0, sizeof(max_load));"),
         ],
+        # pbm: format [%s] butuh __func__; arg kedua adalah volt (bukan string)
+        "drivers/misc/mediatek/base/power/pbm_v4/mtk_pbm.c": [
+            ('pr_notice_ratelimited("[%s] wrong volt=%d, set 4V\\n",\n\t\t\tbat_vol);',
+             'pr_notice_ratelimited("[%s] wrong volt=%d, set 4V\\n",\n\t\t\t__func__, bat_vol);'),
+        ],
     }
     for path, subs in post.items():
         p = ROOT / path

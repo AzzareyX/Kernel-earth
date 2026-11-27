@@ -875,7 +875,9 @@ jobs:
                    misleading-indentation memset-elt-size sizeof-pointer-memaccess \
                    unused-variable unused-but-set-variable unused-function \
                    unused-result declaration-after-statement \
-                   sign-compare switch; do
+                   sign-compare switch switch-unreachable parentheses \
+                   array-bounds stringop-overflow stringop-truncation \
+                   maybe-uninitialized uninitialized overflow restrict; do
             # gcc/clang beda daftar warning; lewati yang tidak dikenal supaya
             # flag pengaman ini tidak pernah menggagalkan build itu sendiri.
             if printf 'int main(void){return 0;}\n' | \
@@ -973,8 +975,4 @@ jobs:
           name: kernel-${{ inputs.device_codename }}-${{ steps.meta.outputs.version }}
           path: |
             ${{ steps.package.outputs.zip_path }}
-            ${{ github.workspace }}/cip-upgrade.patch
-            ${{ github.workspace }}/build-info.txt
-          retention-days: 14
-          compression-level: 9
-          if-no-files-found: warn
+            ${{ github.

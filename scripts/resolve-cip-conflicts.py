@@ -383,6 +383,14 @@ def main():
             ('\t\tLOG_INF("DVE:gDveCnt:%d,RequestState:%d,HWIdx:%d\\n",',
              '\tLOG_INF("DVE:gDveCnt:%d,RequestState:%d,HWIdx:%d\\n",'),
         ],
+        # cmdq: sizeof sumber memicu -Wsizeof-pointer-memaccess; pakai
+        # ukuran destination (NAME_MAX) yang memang lebih besar.
+        "drivers/misc/mediatek/cmdq/v3/cmdq_sec_mtee.c": [
+            ("strncpy(tee->ta_uuid, ta_uuid, sizeof(ta_uuid));",
+             "strncpy(tee->ta_uuid, ta_uuid, sizeof(tee->ta_uuid));"),
+            ("strncpy(tee->wsm_uuid, wsm_uuid, sizeof(wsm_uuid));",
+             "strncpy(tee->wsm_uuid, wsm_uuid, sizeof(tee->wsm_uuid));"),
+        ],
     }
     for path, subs in post.items():
         p = ROOT / path

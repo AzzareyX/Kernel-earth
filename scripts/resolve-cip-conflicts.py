@@ -375,6 +375,14 @@ def main():
             ('pr_notice_ratelimited("[%s] wrong volt=%d, set 4V\\n",\n\t\t\tbat_vol);',
              'pr_notice_ratelimited("[%s] wrong volt=%d, set 4V\\n",\n\t\t\t__func__, bat_vol);'),
         ],
+        # camera_dpe: dua LOG_INF setelah if tanpa brace diindentasi 2 tab,
+        # seolah ikut terlindungi. Turunkan 1 tab (perilaku sama, warning hilang).
+        "drivers/misc/mediatek/cameraisp/dpe/mt6768/camera_dpe.c": [
+            ('\t\tLOG_INF("DVE:bFound:%d, DveWriteIdx:%d, WriteIdx:%d\\n",',
+             '\tLOG_INF("DVE:bFound:%d, DveWriteIdx:%d, WriteIdx:%d\\n",'),
+            ('\t\tLOG_INF("DVE:gDveCnt:%d,RequestState:%d,HWIdx:%d\\n",',
+             '\tLOG_INF("DVE:gDveCnt:%d,RequestState:%d,HWIdx:%d\\n",'),
+        ],
     }
     for path, subs in post.items():
         p = ROOT / path

@@ -975,4 +975,8 @@ jobs:
           name: kernel-${{ inputs.device_codename }}-${{ steps.meta.outputs.version }}
           path: |
             ${{ steps.package.outputs.zip_path }}
-            ${{ github.
+            ${{ github.workspace }}/cip-upgrade.patch
+            ${{ github.workspace }}/build-info.txt
+          retention-days: 14
+          compression-level: 9
+          if-no-files-found: warn

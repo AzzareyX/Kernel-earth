@@ -108,6 +108,11 @@ on:
         required: true
         type: string
         default: 'earth'
+      use_vendor_network:
+        description: 'DIAGNOSTIC: pakai stack jaringan dari source HEAD (Wi-Fi/hotspot/data), bukan hasil merge CIP'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -140,6 +145,7 @@ jobs:
       AK3_REPO: ${{ inputs.anykernel3_repo }}
       AK3_BRANCH: ${{ inputs.anykernel3_branch }}
       DEVICE: ${{ inputs.device_codename }}
+      USE_VENDOR_NETWORK: ${{ inputs.use_vendor_network }}
       WORKDIR: ${{ github.workspace }}/kernel
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CONFLICT_DIR: ${{ github.workspace }}/conflict-logs
@@ -874,7 +880,33 @@ jobs:
           echo "CIP      : $CIP_TAG ($(git rev-parse "$CIP_OBJ" 2>/dev/null || echo n/a))"
           echo "ccache   : $(ccache --version | head -n 1)"
 
+          # Opsi DIAGNOSTIK: kembalikan stack jaringan ke versi source HEAD.
+          # Dipakai hanya untuk menguji apakah masalah Wi-Fi/hotspot/data
+          # berasal dari perubahan jaringan CIP. Ini menurunkan fix keamanan
+          # jaringan CIP, jadi JANGAN dipakai untuk build final.
+          if [ "${USE_VENDOR_NETWORK:-false}" = "true" ]; then
+            echo "DIAGNOSTIC: restore jaringan dari SOURCE_SHA=$SOURCE_SHA"
+            for p in net include/net drivers/net \
+                     include/linux/netdevice.h include/linux/skbuff.h \
+                     include/linux/ip.h include/linux/ipv6.h \
+                     include/linux/tcp.h include/linux/udp.h \
+                     drivers/misc/mediatek/connectivity; do
+              if git cat-file -e "$SOURCE_SHA:$p" 2>/dev/null; then
+                git checkout "$SOURCE_SHA" -- "$p"
+                echo "RESTORE_FROM_SOURCE: $p"
+              fi
+            done
+          fi
+
           make O=out ARCH="$ARCH" "$DEFCONFIG"
+
+          # Pastikan driver Wi-Fi MediaTek tetap built-in setelah merge CIP.
+          # Kalau config ini hilang, Wi-Fi/hotspot bisa mati walaupun boot sukses.
+          for cfg in CONFIG_CFG80211=y CONFIG_WLAN_DRV_BUILD_IN=y; do
+            if ! grep -q "^${cfg}\$" out/.config; then
+              echo "::warning::$cfg tidak ada di .config - cek Wi-Fi setelah flash"
+            fi
+          done
 
           # Vendor MediaTek lama punya banyak warning di GCC runner (format,
           # misleading-indentation, memset-elt-size, dll). Makefile vendor

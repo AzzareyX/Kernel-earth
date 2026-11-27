@@ -391,6 +391,16 @@ def main():
             ("strncpy(tee->wsm_uuid, wsm_uuid, sizeof(wsm_uuid));",
              "strncpy(tee->wsm_uuid, wsm_uuid, sizeof(tee->wsm_uuid));"),
         ],
+        # musb_qmu: string literal 3 baris tanpa kutip pembuka/penutup per
+        # baris. Ini hard error, bukan warning, jadi tidak bisa ditekan KCFLAGS.
+        "drivers/misc/mediatek/usb20/musb_qmu.c": [
+            ('\t\t\tpr_debug("<ratelimit> avg sleep(%lu/%d, %lu)us,\n'
+             '\t\t\tavg wake(%lu/%d, %lu)us, mode<%d,%d>,\n'
+             '\t\t\tlocal balanced<%d,%d>\\n"',
+             '\t\t\tpr_debug("<ratelimit> avg sleep(%lu/%d, %lu)us, "\n'
+             '\t\t\t"avg wake(%lu/%d, %lu)us, mode<%d,%d>, "\n'
+             '\t\t\t"local balanced<%d,%d>\\n"'),
+        ],
     }
     for path, subs in post.items():
         p = ROOT / path

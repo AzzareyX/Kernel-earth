@@ -17,6 +17,7 @@ supaya tidak ada resolusi yang ditebak secara membabi buta.
 """
 import pathlib
 import re
+import subprocess
 import sys
 
 ROOT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
@@ -324,6 +325,15 @@ def main():
             ('dev_info(dev, "%s: %d\\n", __func__, offset);',
              'dev_info(dev, "%s: %ld\\n", __func__, (long)offset);'),
         ],
+        # mtk-usip: arg adalah unsigned long, bukan unsigned int
+        "sound/soc/mediatek/common/mtk-usip.c": [
+            ('Fail copy CALL_ENH_CONFIG from user Ptr: %x',
+             'Fail copy CALL_ENH_CONFIG from user Ptr: %lx'),
+            ('Fail copy CALL_ENH_CONFIG to user Ptr: %x',
+             'Fail copy CALL_ENH_CONFIG to user Ptr: %x'),
+            ('memory_size = %ld addr_phy = 0x%llx',
+             'memory_size = %zu addr_phy = 0x%llx'),
+        ],
     }
     for path, subs in post.items():
         p = ROOT / path
@@ -404,6 +414,91 @@ def main():
             if anchor in s:
                 p.write_text(s.replace(anchor, helper + anchor, 1))
                 print("POST-FIX: sugov_update_rate_limit_us helper")
+
+    # filter.c: HEAD menyimpan case vendor (SOCK_OPS_GET_TCP_SOCK_FIELD /
+    # SOCK_OPS_GET_SK) di LUAR blok konflik. CIP menghapus macro itu, jadi
+    # resolver per-blok tidak cukup. Ambil seluruh fungsi dari CIP, lalu
+    # tambahkan kembali hanya case vendor yang memang tidak ada di CIP.
+    p = ROOT / "net/core/filter.c"
+    if p.is_file():
+        s = p.read_text()
+        try:
+            cip_src = subprocess.check_output(
+                ["git", "-C", str(ROOT), "show",
+                 "refs/remotes/cip/cip-target:net/core/filter.c"],
+                text=True)
+            ca = cip_src.index("static u32 sock_ops_convert_ctx_access(")
+            cb = cip_src.index("\nstatic u32 sk_skb_convert_ctx_access(", ca)
+            fn = cip_src[ca:cb]
+
+            sk_macro = (
+                "#define SOCK_OPS_GET_SK()"
+                " do { \\\n"
+                "\t*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF("
+                "struct bpf_sock_ops_kern, sk), \\\n"
+                "\t\t\t\t      si->dst_reg, si->src_reg, \\\n"
+                "\t\t\t\t      offsetof(struct bpf_sock_ops_kern, sk)); \\\n"
+                "} while (0)\n\n"
+            )
+            if "/* Helper macro for adding read access" in fn:
+                fn = fn.replace("/* Helper macro for adding read access",
+                                sk_macro + "/* Helper macro for adding read access", 1)
+
+            vendor_cases = (
+                "\tcase offsetof(struct bpf_sock_ops, sk):\n"
+                "\t\tSOCK_OPS_GET_SK();\n"
+                "\t\tbreak;\n"
+                "\tcase offsetof(struct bpf_sock_ops, skb_data_end):\n"
+                "\t\t*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct bpf_sock_ops_kern,\n"
+                "\t\t\t\t\t\t       skb_data_end),\n"
+                "\t\t\t\t\t      si->dst_reg, si->src_reg,\n"
+                "\t\t\t\t\t      offsetof(struct bpf_sock_ops_kern,\n"
+                "\t\t\t\t\t\t       skb_data_end));\n"
+                "\t\tbreak;\n"
+                "\tcase offsetof(struct bpf_sock_ops, skb_data):\n"
+                "\t\t*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct bpf_sock_ops_kern,\n"
+                "\t\t\t\t\t\t       skb),\n"
+                "\t\t\t\t\t      si->dst_reg, si->src_reg,\n"
+                "\t\t\t\t\t      offsetof(struct bpf_sock_ops_kern, skb));\n"
+                "\t\t*insn++ = BPF_JMP_IMM(BPF_JEQ, si->dst_reg, 0, 1);\n"
+                "\t\t*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, data),\n"
+                "\t\t\t\t\t      si->dst_reg, si->dst_reg,\n"
+                "\t\t\t\t\t      offsetof(struct sk_buff, data));\n"
+                "\t\tbreak;\n"
+                "\tcase offsetof(struct bpf_sock_ops, skb_len):\n"
+                "\t\t*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct bpf_sock_ops_kern,\n"
+                "\t\t\t\t\t\t       skb),\n"
+                "\t\t\t\t\t      si->dst_reg, si->src_reg,\n"
+                "\t\t\t\t\t      offsetof(struct bpf_sock_ops_kern, skb));\n"
+                "\t\t*insn++ = BPF_JMP_IMM(BPF_JEQ, si->dst_reg, 0, 1);\n"
+                "\t\t*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, len),\n"
+                "\t\t\t\t\t      si->dst_reg, si->dst_reg,\n"
+                "\t\t\t\t\t      offsetof(struct sk_buff, len));\n"
+                "\t\tbreak;\n"
+                "\tcase offsetof(struct bpf_sock_ops, skb_tcp_flags):\n"
+                "\t\toff = offsetof(struct sk_buff, cb);\n"
+                "\t\toff += offsetof(struct tcp_skb_cb, tcp_flags);\n"
+                "\t\t*target_size = FIELD_SIZEOF(struct tcp_skb_cb, tcp_flags);\n"
+                "\t\t*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct bpf_sock_ops_kern,\n"
+                "\t\t\t\t\t\t       skb),\n"
+                "\t\t\t\t\t      si->dst_reg, si->src_reg,\n"
+                "\t\t\t\t\t      offsetof(struct bpf_sock_ops_kern, skb));\n"
+                "\t\t*insn++ = BPF_JMP_IMM(BPF_JEQ, si->dst_reg, 0, 1);\n"
+                "\t\t*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct tcp_skb_cb,\n"
+                "\t\t\t\t\t\t       tcp_flags),\n"
+                "\t\t\t\t\t      si->dst_reg, si->dst_reg, off);\n"
+                "\t\tbreak;\n"
+            )
+            tail = "\n\t}\n\treturn insn - insn_buf;\n}"
+            if tail in fn:
+                fn = fn.replace(tail, "\n" + vendor_cases + tail, 1)
+
+            ma = s.index("static u32 sock_ops_convert_ctx_access(")
+            mb = s.index("\nstatic u32 sk_skb_convert_ctx_access(", ma)
+            p.write_text(s[:ma] + fn + s[mb:])
+            print("POST-FIX: net/core/filter.c (sock_ops from CIP + vendor cases)")
+        except (subprocess.CalledProcessError, ValueError) as exc:
+            errors.append("filter.c CIP function replacement failed: " + str(exc))
 
     if errors:
         print("\n=== TIDAK SEPENUHNYA BERHASIL ===", file=sys.stderr)

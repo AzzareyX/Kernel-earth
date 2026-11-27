@@ -362,6 +362,14 @@ def main():
             ('mtk_v4l2_err("dma_buf_map_attachment fail %d.\\n", sgt);',
              'mtk_v4l2_err("dma_buf_map_attachment fail %p.\\n", sgt);'),
         ],
+        # -Werror=memset-elt-size: ARRAY_SIZE() menghitung elemen, bukan byte.
+        # Baris 523 juga salah sasaran (count_ack), jadi pakai sizeof(max_load).
+        "drivers/misc/mediatek/base/power/cm_mgr_v1/mtk_cm_mgr.c": [
+            ("memset(count_ack, 0, ARRAY_SIZE(count_ack));",
+             "memset(count_ack, 0, sizeof(count_ack));"),
+            ("memset(max_load, 0, ARRAY_SIZE(count_ack));",
+             "memset(max_load, 0, sizeof(max_load));"),
+        ],
     }
     for path, subs in post.items():
         p = ROOT / path

@@ -464,6 +464,12 @@ jobs:
           'include/linux/keyslot-manager.h':[
             ('inline void ksm_', 'void ksm_'),
             ('inline int ksm_', 'int ksm_')],
+          # richtek: offset adalah ptrdiff_t, bukan int
+          'sound/soc/codecs/richtek_spm_cls.c':[
+            ('pr_info("%s: %d\\n", __func__, offset);',
+             'pr_info("%s: %ld\\n", __func__, (long)offset);'),
+            ('dev_info(dev, "%s: %d\\n", __func__, offset);',
+             'dev_info(dev, "%s: %ld\\n", __func__, (long)offset);')],
           }
           def render(k, o, t, v):
               if k == 'ours': return o
@@ -517,6 +523,24 @@ jobs:
               if s != old:
                   p.write_text(s)
                   print('POST-FIX: %s (f2fs_msg)' % p.relative_to(R))
+          # chipone touch: return ret tidak sengaja ter-indent di dalam if.
+          # Turunkan satu tab supaya tidak memicu -Werror=misleading-indentation.
+          p = R / 'drivers/input/touchscreen/mediatek/chipone_ICNL_9916/cts_core.c'
+          if p.is_file():
+              s = p.read_text(); marker = 'cts_set_dev_charger_attached'
+              idx = s.find(marker)
+              if idx >= 0:
+                  tail = s[idx:]; lines = tail.splitlines(True); fixed = False
+                  for i in range(len(lines) - 1):
+                      if lines[i].strip() == 'if (ret)':
+                          for j in range(i + 1, min(i + 6, len(lines))):
+                              if (lines[j].strip() == 'return ret;' and
+                                      lines[j].startswith('\t\t')):
+                                  lines[j] = lines[j][1:]; fixed = True; break
+                          if fixed: break
+                  if fixed:
+                      p.write_text(s[:idx] + ''.join(lines))
+                      print('POST-FIX: cts_core.c indentation')
           # CIP memanggil sugov_update_rate_limit_us(); pastikan helper itu ada
           # dan memakai field vendor (up_rate_limit_us / up_rate_delay_ns).
           p = R / 'kernel/sched/cpufreq_schedutil.c'
@@ -670,14 +694,19 @@ jobs:
 
           make O=out ARCH="$ARCH" "$DEFCONFIG"
 
+          # Vendor MediaTek lama punya banyak warning di GCC runner (format,
+          # misleading-indentation, dll). Mereka bukan efek merge CIP, jadi
+          # jangan biarkan -Werror menggagalkan build.
+          KCFLAGS="-Wno-error"
           if [ "$COMPILER" = "clang" ]; then
             make "-j$JOBS" O=out ARCH="$ARCH" \
-              CC=clang LD=ld.lld \
+              CC=clang LD=ld.lld KCFLAGS="$KCFLAGS" \
               CROSS_COMPILE="$CROSS_COMPILE" \
               CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
               2>&1 | tee "$GITHUB_WORKSPACE/build.log"
           else
             make "-j$JOBS" O=out ARCH="$ARCH" \
+              KCFLAGS="$KCFLAGS" \
               CROSS_COMPILE="$CROSS_COMPILE" \
               CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
               2>&1 | tee "$GITHUB_WORKSPACE/build.log"

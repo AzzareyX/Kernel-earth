@@ -862,12 +862,21 @@ jobs:
           # -Wno-error=X (spesifik) tetap menang walau -Werror umum datang
           # belakangan, jadi dipakai sebagai pengaman tambahan.
           KCFLAGS="-Wno-error"
+          PROBE_CC=gcc
+          [ "$COMPILER" = "clang" ] && PROBE_CC=clang
           for w in format format-extra-args format-overflow format-truncation \
                    misleading-indentation memset-elt-size \
                    unused-variable unused-but-set-variable unused-function \
-                   unused-result declaration-after-statement macro-redefined \
+                   unused-result declaration-after-statement \
                    sign-compare switch; do
-            KCFLAGS="$KCFLAGS -Wno-error=$w"
+            # gcc/clang beda daftar warning; lewati yang tidak dikenal supaya
+            # flag pengaman ini tidak pernah menggagalkan build itu sendiri.
+            if printf 'int main(void){return 0;}\n' | \
+                 "$PROBE_CC" "-Wno-error=$w" -x c -c -o /dev/null - 2>/dev/null; then
+              KCFLAGS="$KCFLAGS -Wno-error=$w"
+            else
+              echo "skip unsupported warning: -Wno-error=$w"
+            fi
           done
           echo "KCFLAGS: $KCFLAGS"
           if [ "$COMPILER" = "clang" ]; then

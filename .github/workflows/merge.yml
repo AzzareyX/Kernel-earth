@@ -510,6 +510,13 @@ jobs:
           'drivers/misc/mediatek/base/power/pbm_v4/mtk_pbm.c':[
             ('pr_notice_ratelimited("[%s] wrong volt=%d, set 4V\\n",\n\t\t\tbat_vol);',
              'pr_notice_ratelimited("[%s] wrong volt=%d, set 4V\\n",\n\t\t\t__func__, bat_vol);')],
+          # camera_dpe: dua LOG_INF setelah if tanpa brace diindentasi 2 tab,
+          # seolah ikut terlindungi. Turunkan 1 tab (perilaku sama, warning hilang).
+          'drivers/misc/mediatek/cameraisp/dpe/mt6768/camera_dpe.c':[
+            ('\t\tLOG_INF("DVE:bFound:%d, DveWriteIdx:%d, WriteIdx:%d\\n",',
+             '\tLOG_INF("DVE:bFound:%d, DveWriteIdx:%d, WriteIdx:%d\\n",'),
+            ('\t\tLOG_INF("DVE:gDveCnt:%d,RequestState:%d,HWIdx:%d\\n",',
+             '\tLOG_INF("DVE:gDveCnt:%d,RequestState:%d,HWIdx:%d\\n",')],
           }
           def render(k, o, t, v):
               if k == 'ours': return o
@@ -850,9 +857,19 @@ jobs:
           make O=out ARCH="$ARCH" "$DEFCONFIG"
 
           # Vendor MediaTek lama punya banyak warning di GCC runner (format,
-          # misleading-indentation, dll). Mereka bukan efek merge CIP, jadi
-          # jangan biarkan -Werror menggagalkan build.
+          # misleading-indentation, memset-elt-size, dll). Makefile vendor
+          # menambahkan -Werror *setelah* KCFLAGS, jadi -Wno-error umum kalah.
+          # -Wno-error=X (spesifik) tetap menang walau -Werror umum datang
+          # belakangan, jadi dipakai sebagai pengaman tambahan.
           KCFLAGS="-Wno-error"
+          for w in format format-extra-args format-overflow format-truncation \
+                   misleading-indentation memset-elt-size \
+                   unused-variable unused-but-set-variable unused-function \
+                   unused-result declaration-after-statement macro-redefined \
+                   sign-compare switch; do
+            KCFLAGS="$KCFLAGS -Wno-error=$w"
+          done
+          echo "KCFLAGS: $KCFLAGS"
           if [ "$COMPILER" = "clang" ]; then
             make "-j$JOBS" O=out ARCH="$ARCH" \
               CC=clang LD=ld.lld KCFLAGS="$KCFLAGS" \

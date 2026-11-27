@@ -524,6 +524,17 @@ jobs:
              'strncpy(tee->ta_uuid, ta_uuid, sizeof(tee->ta_uuid));'),
             ('strncpy(tee->wsm_uuid, wsm_uuid, sizeof(wsm_uuid));',
              'strncpy(tee->wsm_uuid, wsm_uuid, sizeof(tee->wsm_uuid));')],
+          # musb_qmu: string literal 3 baris tanpa kutip pembuka/penutup per
+          # baris. Ini hard error ("missing terminating \" character"), bukan
+          # warning, jadi tidak bisa ditekan dengan KCFLAGS. Tutup tiap baris
+          # dan buka literal berikutnya agar pesannya tetap sama.
+          'drivers/misc/mediatek/usb20/musb_qmu.c':[
+            ('\t\t\tpr_debug("<ratelimit> avg sleep(%lu/%d, %lu)us,\n'
+             '\t\t\tavg wake(%lu/%d, %lu)us, mode<%d,%d>,\n'
+             '\t\t\tlocal balanced<%d,%d>\\n"',
+             '\t\t\tpr_debug("<ratelimit> avg sleep(%lu/%d, %lu)us, "\n'
+             '\t\t\t"avg wake(%lu/%d, %lu)us, mode<%d,%d>, "\n'
+             '\t\t\t"local balanced<%d,%d>\\n"')],
           }
           def render(k, o, t, v):
               if k == 'ours': return o
@@ -555,9 +566,11 @@ jobs:
           for path, subs in POST.items():
               p = R / path
               if p.is_file():
-                  s = p.read_text()
+                  s = p.read_text(); old = s
                   for a, b in subs: s = s.replace(a, b)
-                  p.write_text(s)
+                  if s != old:
+                      p.write_text(s)
+                      print('POST-FIX: ' + path)
           # f2fs_msg(sb, level, ...) tidak ada di vendor tree. CIP menyisipkannya
           # di file non-konflik juga (mis. checkpoint.c), jadi sweep semua file.
           F2FS_MSG = [

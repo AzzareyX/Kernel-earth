@@ -876,7 +876,9 @@ jobs:
                    unused-variable unused-but-set-variable unused-function \
                    unused-value unused-result declaration-after-statement \
                    sign-compare switch switch-unreachable parentheses \
-                   array-bounds stringop-overflow stringop-truncation \
+                   array-parameter array-bounds stringop-overflow stringop-truncation \
+                   stringop-overread dangling-pointer pointer-to-int-cast \
+                   enum-compare undef int-conversion \
                    maybe-uninitialized uninitialized overflow restrict; do
             # gcc/clang beda daftar warning; lewati yang tidak dikenal supaya
             # flag pengaman ini tidak pernah menggagalkan build itu sendiri.

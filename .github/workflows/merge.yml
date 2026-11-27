@@ -464,6 +464,9 @@ jobs:
           'include/linux/keyslot-manager.h':[
             ('inline void ksm_', 'void ksm_'),
             ('inline int ksm_', 'int ksm_')],
+          'include/linux/blk-crypto.h':[
+            ('inline void blk_crypto_flock(struct keyslot_manager *ksm, unsigned int flags);',
+             'void blk_crypto_flock(struct keyslot_manager *ksm, unsigned int flags);')],
           # richtek: offset adalah ptrdiff_t, bukan int
           'sound/soc/codecs/richtek_spm_cls.c':[
             ('pr_info("%s: %d\\n", __func__, offset);',
@@ -476,6 +479,23 @@ jobs:
              'Fail copy CALL_ENH_CONFIG from user Ptr: %lx'),
             ('memory_size = %ld addr_phy = 0x%llx',
              'memory_size = %zu addr_phy = 0x%llx')],
+          # btcvsd: irq status dibaca ke u32, bukan unsigned long
+          'sound/soc/mediatek/common/mtk-btcvsd.c':[
+            ('bt_reg_ctl = 0x%lx', 'bt_reg_ctl = 0x%x')],
+          # mtk-vcu: tmp->pa adalah unsigned long; cook/va adalah void *
+          'drivers/media/platform/mtk-vcu/mtk_vcodec_mem.c':[
+            ('Free cmdq pa %llx ref_cnt = %d',
+             'Free cmdq pa %lx ref_cnt = %d'),
+            ('iova = %llx va = %llx va_id = %lld',
+             'iova = %llx va = %p va_id = %lld'),
+            ('Free buff = %d iova = %llx va = %llx va_id = %llx',
+             'Free buff = %d iova = %llx va = %p va_id = %llx')],
+          # mtk-vcodec: sgt adalah struct sg_table *; satu format kehilangan arg
+          'drivers/media/platform/mtk-vcodec/mtk_vcodec_dec.c':[
+            ('mtk_v4l2_err("dma_buf_map_attachment fail %d.\\n", sgt);',
+             'mtk_v4l2_err("dma_buf_map_attachment fail %p.\\n", sgt);'),
+            ('mtk_v4l2_err("[%d]Error!!src_buf is NULL!");',
+             'mtk_v4l2_err("Error!!src_buf is NULL!");')],
           }
           def render(k, o, t, v):
               if k == 'ours': return o
@@ -529,24 +549,25 @@ jobs:
               if s != old:
                   p.write_text(s)
                   print('POST-FIX: %s (f2fs_msg)' % p.relative_to(R))
-          # chipone touch: return ret tidak sengaja ter-indent di dalam if.
-          # Turunkan satu tab supaya tidak memicu -Werror=misleading-indentation.
+          # chipone touch: source memakai 4 spasi untuk if/cts_err tetapi satu
+          # tab untuk return ret, sehingga -Werror=misleading-indentation:
+          # mengeluh. Samakan ke tab (CRLF juga dinormalkan jadi LF).
           p = R / 'drivers/input/touchscreen/mediatek/chipone_ICNL_9916/cts_core.c'
           if p.is_file():
-              s = p.read_text(); marker = 'cts_set_dev_charger_attached'
-              idx = s.find(marker)
-              if idx >= 0:
-                  tail = s[idx:]; lines = tail.splitlines(True); fixed = False
-                  for i in range(len(lines) - 1):
-                      if lines[i].strip() == 'if (ret)':
-                          for j in range(i + 1, min(i + 6, len(lines))):
-                              if (lines[j].strip() == 'return ret;' and
-                                      lines[j].startswith('\t\t')):
-                                  lines[j] = lines[j][1:]; fixed = True; break
-                          if fixed: break
-                  if fixed:
-                      p.write_text(s[:idx] + ''.join(lines))
-                      print('POST-FIX: cts_core.c indentation')
+              s = p.read_text()
+              old = ('    if (ret)\n'
+                     '        cts_err("Send CMD_CHARGER_%s failed %d", attached ? "ATTACHED" : "DETACHED", ret);\n'
+                     '\n'
+                     '\treturn ret;')
+              new = ('\tif (ret)\n'
+                     '\t\tcts_err("Send CMD_CHARGER_%s failed %d", attached ? "ATTACHED" : "DETACHED", ret);\n'
+                     '\n'
+                     '\treturn ret;')
+              if old in s:
+                  p.write_text(s.replace(old, new, 1))
+                  print('POST-FIX: cts_core.c indentation')
+              elif '\tif (ret)\n\t\tcts_err("Send CMD_CHARGER_' not in s:
+                  print('WARN: cts_core.c indentation pattern not found')
           # CIP memanggil sugov_update_rate_limit_us(); pastikan helper itu ada
           # dan memakai field vendor (up_rate_limit_us / up_rate_delay_ns).
           p = R / 'kernel/sched/cpufreq_schedutil.c'
